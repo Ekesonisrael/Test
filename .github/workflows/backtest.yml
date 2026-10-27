@@ -1,0 +1,72 @@
+name: backtest
+
+# Each push to main that changes backtest.py = one trial.
+# Manual dispatch is a re-run; note the trial rule at the top of backtest.py.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - backtest.py
+      - requirements.txt
+      - .github/workflows/backtest.yml
+
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a running trial; queue instead
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest
+        id: bt
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python backtest.py 2>&1 | tee backtest_output.txt
+
+      - name: Upload full output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-output-run-${{ github.run_number }}
+          path: backtest_output.txt
+          retention-days: 90
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Backtest — run ${{ github.run_number }}"
+            echo ""
+            echo "Commit: \`${{ github.sha }}\`"
+            echo ""
+            echo '```'
+            tail -n 60 backtest_output.txt 2>/dev/null || echo "no output"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Propagate backtest exit code
+        if: always() && steps.bt.outcome == 'failure'
+        run: |
+          echo "Backtest exited non-zero (FAIL or INCONCLUSIVE)."
+          echo "See summary above; full log in artifact backtest-output-run-${{ github.run_number }}."
+          exit 1
