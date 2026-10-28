@@ -157,4 +157,3 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 if __name__ == "__main__":
     run_backtest("BTC-USDT-SWAP")
     run_backtest("SOL-USDT-SWAP")
-    
