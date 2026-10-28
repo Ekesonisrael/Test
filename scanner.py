@@ -43,10 +43,9 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     balance = initial_balance
     trades = []
     
-    # Asset-specific stop-loss cushion based on volatility profile
-    # SOL has wider wicks, needs more breathing room than BTC
+    # Asset-specific stop-loss cushion
     if "SOL" in inst:
-        sl_buffer = 0.992  # 0.8% below sweep low
+        sl_buffer = 0.988  # 1.2% below sweep low for SOL's volatile wicks
     else:
         sl_buffer = 0.997  # 0.3% below sweep low for BTC
     
@@ -146,7 +145,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} ASSET-ADJUSTED BUFFER BACKTEST =====")
+    print(f"\n===== {inst} WIDENED SOL BUFFER BACKTEST =====")
     print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
     print(f"Total Trades: {len(trades)}")
     print(f"Wins: {wins} | Losses: {losses}")
