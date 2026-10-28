@@ -48,9 +48,9 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
     missed_limit_fills = 0
     macro_blocked = 0
     
-    rr_target = 3.0       # Bumped to 3.0 to absorb funding (Claude's fix)
+    rr_target = 3.0       
     lookback = 15
-    slippage = 0.0005     # 0.05% slippage penalty (Claude's fix)
+    slippage = 0.0005     
     
     i = lookback + 15
     while i < len(sol_df) - 100:
@@ -70,7 +70,7 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
         prior_low = sol_df['l'].iloc[i-lookback:i].min()
         prior_high = sol_df['h'].iloc[i-lookback:i].max()
         
-        # Macro BTC Trend
+        # Macro BTC Trend Filter
         btc_is_bullish = sweep['btc_close'] >= sweep['btc_ema']
         btc_is_bearish = sweep['btc_close'] < sweep['btc_ema']
         
@@ -80,27 +80,27 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
         if is_bullish and btc_is_bullish:
             if sweep['l'] < prior_low and sweep['c'] > prior_low:
                 if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
-                    limit_price = entry_candle['o']
-                    # LIMIT FILL CHECK: Did price drop to our limit?
+                    # Realistic Limit: We want to buy slightly below the open on a small dip
+                    limit_price = entry_candle['o'] * 0.999
+                    # LIMIT FILL CHECK: Did the candle's low drop down to our limit price?
                     if entry_candle['l'] > limit_price:
                         missed_limit_fills += 1
                     else:
                         side = "LONG"
-                        raw_entry = limit_price
-                        entry_price = raw_entry * (1.0 + slippage) # Apply slippage to entry
+                        entry_price = limit_price * (1.0 + slippage)
                         
         # --- SHORT SETUP ---
         elif is_bearish and btc_is_bearish:
             if sweep['h'] > prior_high and sweep['c'] < prior_high:
                 if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
-                    limit_price = entry_candle['o']
-                    # LIMIT FILL CHECK: Did price rise to our limit?
+                    # Realistic Limit: We want to sell slightly above the open on a small bounce
+                    limit_price = entry_candle['o'] * 1.001
+                    # LIMIT FILL CHECK: Did the candle's high rise up to our limit price?
                     if entry_candle['h'] < limit_price:
                         missed_limit_fills += 1
                     else:
                         side = "SHORT"
-                        raw_entry = limit_price
-                        entry_price = raw_entry * (1.0 - slippage) # Apply slippage to entry
+                        entry_price = limit_price * (1.0 - slippage)
 
         if side:
             if side == "LONG":
@@ -113,14 +113,12 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
                 tp = entry_price - (risk_distance * rr_target)
 
             if risk_distance > 0:
-                # Position Sizing
                 risk_amount = balance * risk_pct
                 position_size = risk_amount / risk_distance
                 max_notional = balance * leverage
                 if (position_size * entry_price) > max_notional:
                     position_size = max_notional / entry_price
 
-                # Forward Test
                 outcome = "OPEN"
                 exit_price = None
                 max_forward = min(i + 50, len(sol_df) - 1)
@@ -129,7 +127,7 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
                     future = sol_df.iloc[j]
                     if side == "LONG":
                         if future['l'] <= sl: 
-                            outcome = "LOSS"; exit_price = sl * (1.0 - slippage); break # Slippage on exit
+                            outcome = "LOSS"; exit_price = sl * (1.0 - slippage); break
                         elif future['h'] >= tp: 
                             outcome = "WIN"; exit_price = tp * (1.0 - slippage); break
                     else:
@@ -140,9 +138,8 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
                         
                 if outcome == "OPEN":
                     outcome = "TIMEOUT"
-                    exit_price = sol_df.iloc[max_forward]['c'] # Exit at market (slippage handled in fee calc below)
+                    exit_price = sol_df.iloc[max_forward]['c']
 
-                # PnL Calculation (with fees & slippage baked into entry/exit)
                 if side == "LONG":
                     pnl = (exit_price - entry_price) * position_size
                 else:
@@ -152,14 +149,12 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
                 trades.append({"time": entry_candle['ts'], "side": side, "outcome": outcome, "net_pnl": pnl})
                 i = j 
         else:
-            # If no side but conditions were met, it's because of macro filters
             if (is_bullish and sweep['l'] < prior_low) or (is_bearish and sweep['h'] > prior_high):
                 if not btc_is_bullish and not btc_is_bearish:
                     macro_blocked += 1
                     
         i += 1
 
-    # --- RESULTS ---
     if not trades:
         print("\n[SOL-USDT] No valid setups found.")
         return
@@ -173,6 +168,7 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
     print(f"Total Trades Executed: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
     print(f"Missed Trades (Limit Not Filled): {missed_limit_fills}")
+    print(f"Macro Filter Blocked Setups: {macro_blocked}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
