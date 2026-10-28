@@ -16,7 +16,7 @@ CHANGELOG (pre-first-real-run, from code review — not counted as a trial):
     would drift, so it wouldn't be a "matched" null. Chosen deliberately.
   - Empty bear-slice in funding-drag report now prints nan%, not crash.
   - Added sanity checks to funding fetch: column count >= 3, |rate| < 5%.
-  - Filter out future-dated candles from OKX API.
+  - Filter out future-dated candles from OKX API (using naive UTC to match index).
   - NOTE ON VOL TARGET: TARGET_VOL is PER COIN, not portfolio. With BTC/SOL
     correlation ~0.75, realised PORTFOLIO vol runs ~14% vs 15% per-coin.
     Reported explicitly in output. Frozen as per-coin; do not change post-run.
@@ -73,8 +73,11 @@ def fetch_okx(inst):
     df.index = pd.to_datetime(df.ts.astype("int64"), unit="ms").dt.normalize()
     df = df.sort_index()[["o", "c"]].astype(float)
     df.columns = ["open", "close"]
-    # Filter out any future-dated candles
-    df = df[df.index <= pd.Timestamp.utcnow().normalize()]
+    
+    # Filter out any future-dated candles (using naive UTC to match index)
+    today_naive = pd.Timestamp.now(tz='UTC').tz_localize(None).normalize()
+    df = df[df.index <= today_naive]
+    
     return df[~df.index.duplicated()]
 
 
