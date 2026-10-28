@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Simulates the 200-SMA bot with real money math on historical data.
-Requires ZERO API keys. Runs entirely on public data.
-"""
 import pandas as pd
 import requests
 import numpy as np
@@ -18,52 +14,53 @@ def fetch_okx(inst):
         if not j["data"]: break
         rows += j["data"]
         after = j["data"][-1][0]
+    
     df = pd.DataFrame(rows, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
     df = df[df.confirm == "1"]
     df.index = pd.to_datetime(df.ts.astype("int64"), unit="ms").dt.normalize()
+    
+    # FIX: Drop future dates
+    today_naive = pd.Timestamp.now(tz='UTC').tz_localize(None).normalize()
+    df = df[df.index <= today_naive]
+    
     df = df.sort_index()[["c"]].astype(float)
     df.columns = ["close"]
     return df[~df.index.duplicated()]
 
-def simulate(inst, initial_cash=5000.0):
+def analyze(inst):
     df = fetch_okx(inst)
     df['sma'] = df['close'].rolling(200).mean()
-    df = df.dropna()
+    df = df.dropna() # Drop the first 200 days where SMA isn't calculated
     
-    cash = initial_cash
-    position = 0.0
-    trades = []
+    if len(df) == 0:
+        print(f"Not enough data for {inst}")
+        return
+
+    # Calculate daily returns for Buy & Hold vs Strategy
+    df['ret_bh'] = df['close'].pct_change()
     
-    for i in range(1, len(df)):
-        price = df['close'].iloc[i-1] # Buy at yesterday's close
-        signal = df['close'].iloc[i-1] > df['sma'].iloc[i-1]
-        
-        # Buy
-        if signal and position == 0:
-            position = cash / price
-            cash = 0
-            trades.append(f"{df.index[i].date()}: BOUGHT at ${price:.2f}")
-            
-        # Sell
-        elif not signal and position > 0:
-            cash = position * price
-            position = 0
-            trades.append(f"{df.index[i].date()}: SOLD at ${price:.2f}")
-            
-    # Final value
-    final_price = df['close'].iloc[-1]
-    final_val = cash + (position * final_price)
+    # Strategy: If yesterday's close > SMA, we hold today. Else, we sit in cash (0% return)
+    df['signal'] = (df['close'].shift(1) > df['sma'].shift(1)).astype(int)
+    df['ret_strat'] = df['ret_bh'] * df['signal']
+
+    # Group by year
+    df['year'] = df.index.year
+    yearly = df.groupby('year').agg(
+        bh_return=('ret_bh', lambda x: (1 + x).prod() - 1),
+        strat_return=('ret_strat', lambda x: (1 + x).prod() - 1),
+        days_in_cash=('signal', lambda x: (x == 0).sum())
+    )
     
-    print(f"\n--- {inst} SIMULATION ---")
-    print(f"Start Date: {df.index[0].date()} | End Date: {df.index[-1].date()}")
-    print(f"Start Cash: ${initial_cash:.2f}")
-    print(f"Final Value: ${final_val:.2f}")
-    print(f"Total Return: {((final_val/initial_cash)-1)*100:.2f}%")
-    print(f"Number of Trades: {len(trades)}")
-    print("Last 5 trades:")
-    for t in trades[-5:]:
-        print(f"  {t}")
+    print(f"\n================ {inst} (200-SMA) ================")
+    print(f"{'Year':<6} | {'Buy & Hold':<12} | {'Strategy':<12} | {'Days in Cash'}")
+    print("-" * 52)
+    
+    for year, row in yearly.iterrows():
+        bh = f"{row['bh_return']*100:+.1f}%"
+        st = f"{row['strat_return']*100:+.1f}%"
+        cash = int(row['days_in_cash'])
+        print(f"{year:<6} | {bh:<12} | {st:<12} | {cash}")
 
 if __name__ == "__main__":
-    simulate("BTC-USDT-SWAP")
-    simulate("SOL-USDT-SWAP")
+    analyze("BTC-USDT-SWAP")
+    analyze("SOL-USDT-SWAP") 
