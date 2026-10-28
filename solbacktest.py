@@ -5,7 +5,6 @@ import numpy as np
 
 def fetch_data(inst, limit=10000):
     print(f"Fetching {limit} candles for {inst}...")
-    # CHANGED BAR TO 1H
     url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=1H&limit=100"
     all_data = []
     after = ""
@@ -16,11 +15,12 @@ def fetch_data(inst, limit=10000):
         if r["code"] != "0" or not r["data"]: break
         all_data.extend(r["data"])
         after = r["data"][-1][0]
+        # BUG FIX: Claude had this as len(r["data"] < 100)
         if len(r["data"]) < 100: break
         
     df = pd.DataFrame(all_data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
     df = df.iloc[::-1].reset_index(drop=True)
-    for col in ["o", "h", "l", "c"]:
+    for col in ["o", "h", "l", "c", "v"]:
         df[col] = df[col].astype(float)
     
     df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
@@ -28,12 +28,14 @@ def fetch_data(inst, limit=10000):
     df = df[df['ts'] <= today].reset_index(drop=True)
     
     df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
+    df['vol_ma'] = df['v'].rolling(window=20).mean()
+    
     tr = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift()), abs(df['l']-df['c'].shift())], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     
     return df
 
-def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
+def run_proprietary_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     sol_df = fetch_data("SOL-USDT-SWAP")
     btc_df = fetch_data("BTC-USDT-SWAP")
     
@@ -44,22 +46,24 @@ def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     
     balance = initial_balance
     trades = []
+    volume_blocked = 0
     macro_blocked = 0
     
     rr_target = 2.5       
-    lookback = 20        # Deeper lookback for 1H chart
+    lookback = 20        
     slippage = 0.0005     
     
-    i = lookback + 15
-    while i < len(sol_df) - 100: # 100 hour look-ahead (~4 days)
+    i = lookback + 20
+    while i < len(sol_df) - 100:
         sweep = sol_df.iloc[i]
         confirm = sol_df.iloc[i+1]
         entry_candle = sol_df.iloc[i+2]
         
         ema = sweep['ema_50']
         atr = sweep['atr']
+        vol_ma = sweep['vol_ma']
         
-        if pd.isna(atr) or atr == 0: 
+        if pd.isna(atr) or atr == 0 or pd.isna(vol_ma) or vol_ma == 0: 
             i += 1; continue
             
         is_bullish = sweep['c'] >= ema
@@ -73,12 +77,17 @@ def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
         
         side = None
         
+        # VOLUME EXPANSION FILTER: Confirm candle must be 1.4x above average volume
+        has_volume = confirm['v'] > (vol_ma * 1.4)
+        
         # --- LONG SETUP ---
         if is_bullish:
             if sweep['l'] < prior_low and sweep['c'] > prior_low:
                 if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
                     if not btc_is_bullish:
-                        macro_blocked += 1 
+                        macro_blocked += 1
+                    elif not has_volume:
+                        volume_blocked += 1 
                     else:
                         side = "LONG"
                         entry_price = entry_candle['o'] * (1.0 + slippage)
@@ -88,7 +97,9 @@ def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
             if sweep['h'] > prior_high and sweep['c'] < prior_high:
                 if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
                     if not btc_is_bearish:
-                        macro_blocked += 1 
+                        macro_blocked += 1
+                    elif not has_volume:
+                        volume_blocked += 1 
                     else:
                         side = "SHORT"
                         entry_price = entry_candle['o'] * (1.0 - slippage)
@@ -112,7 +123,7 @@ def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
                 outcome = "OPEN"
                 exit_price = None
-                max_forward = min(i + 100, len(sol_df) - 1) # 100 hours timeout
+                max_forward = min(i + 100, len(sol_df) - 1)
                 
                 for j in range(i+3, max_forward):
                     future = sol_df.iloc[j]
@@ -151,14 +162,14 @@ def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
     win_rate = (wins / max(1, wins+losses)) * 100
     
-    print(f"\n===== 1H SOL BACKTEST (1 Year+ of Data) =====")
+    print(f"\n===== PROPRIETARY VOLUME-FILTERED 1H SOL BACKTEST =====")
     print(f"Total Trades Executed: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
-    print(f"Macro Filter Blocked Setups: {macro_blocked}")
+    print(f"Macro Filter Blocked: {macro_blocked} | Low-Volume Traps Blocked: {volume_blocked}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print("============================================")
+    print(f"=======================================================")
 
 if __name__ == "__main__":
-    run_1h_sol_backtest()
+    run_proprietary_sol_backtest()
