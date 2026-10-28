@@ -34,7 +34,7 @@ def fetch_okx_data(inst, limit=3000):
     return df
 
 # ==========================================
-# 2. FIXED TIMEOUT CLASSIFICATION STRATEGY
+# 2. UNCONSTRAINED HOLDING STRATEGY
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
@@ -46,13 +46,13 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     # Asset-specific stop-loss cushion and R:R target mapping
     if "SOL" in inst:
         sl_buffer = 0.988  # 1.2% below sweep low for SOL's volatile wicks
-        rr_target = 4.0    # Higher R:R target to compensate for wider stop distance
+        rr_target = 3.0    # Balanced 1:3 target
     else:
         sl_buffer = 0.997  # 0.3% below sweep low for BTC
-        rr_target = 2.5    # Standard 1:2.5 target for BTC
+        rr_target = 2.0    # Balanced 1:2 target for BTC to ensure high hit rate
     
     i = 60
-    while i < len(df) - 55:
+    while i < len(df) - 10:
         sweep_candle = df.iloc[i]
         confirm_candle = df.iloc[i+1]
 
@@ -78,7 +78,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
             # Asset-adjusted Stop Loss
             sl = sweep_candle['l'] * sl_buffer
             
-            # Asset-adjusted Take Profit Target
+            # Take Profit Target
             risk_distance = entry_price - sl
             if risk_distance <= 0:
                 i += 1
@@ -94,12 +94,12 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
             if (position_size * entry_price) > max_allowed_notional:
                 position_size = max_allowed_notional / entry_price
             
-            # 3. FORWARD TESTING
-            outcome = "TIMEOUT"
+            # 3. FORWARD TESTING (Hold until TP or SL is genuinely hit)
+            outcome = None
             exit_price = None
             
-            end_lookahead = min(i + 52, len(df))
-            for j in range(i+2, end_lookahead):
+            j = i + 2
+            while j < len(df):
                 future_candle = df.iloc[j]
                 
                 hit_sl = future_candle['l'] <= sl
@@ -117,11 +117,10 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
                     outcome = "WIN"
                     exit_price = tp
                     break
+                j += 1
             
-            # Fixed Timeout Handling: explicitly label time-expansions as TIMEOUT
-            if outcome == "TIMEOUT":
-                exit_price = df.iloc[end_lookahead-1]['c']
-                outcome = "TIMEOUT"
+            if outcome is None:
+                break # Reached end of dataset while in a trade
 
             pnl = (exit_price - entry_price) * position_size
             balance += pnl
@@ -146,13 +145,12 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
-    timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} CLEAN TIMEOUT BACKTEST =====")
+    print(f"\n===== {inst} FULL RESOLUTION BACKTEST =====")
     print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
     print(f"Total Trades: {len(trades)}")
-    print(f"Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
+    print(f"Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
