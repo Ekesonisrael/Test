@@ -2,6 +2,15 @@
 import requests
 import pandas as pd
 import numpy as np
+import time
+
+def get_server_time_ms():
+    """Fetches the exact current time from OKX to prevent future-data glitches."""
+    try:
+        r = requests.get("https://www.okx.com/api/v5/public/time", timeout=5).json()
+        return int(r["data"][0]["ts"])
+    except Exception:
+        return int(time.time() * 1000)
 
 def fetch_data(inst, limit=10000):
     print(f"Fetching {limit} candles for {inst}...")
@@ -9,22 +18,31 @@ def fetch_data(inst, limit=10000):
     all_data = []
     after = ""
     
+    now_ms = get_server_time_ms()
+    
     while len(all_data) < limit:
         req_url = url + (f"&after={after}" if after else "")
-        r = requests.get(req_url, timeout=10).json()
-        if r["code"] != "0" or not r["data"]: break
-        all_data.extend(r["data"])
-        after = r["data"][-1][0]
-        if len(r["data"]) < 100: break
+        try:
+            r = requests.get(req_url, timeout=10).json()
+            if r["code"] != "0" or not r["data"]: break
+            all_data.extend(r["data"])
+            after = r["data"][-1][0]
+            if len(r["data"]) < 100: break
+        except Exception:
+            break
+        
+    if not all_data:
+        return None
         
     df = pd.DataFrame(all_data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["o", "h", "l", "c"]:
         df[col] = df[col].astype(float)
     
-    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
-    today = pd.Timestamp.now('UTC').tz_localize(None)
-    df = df[df['ts'] <= today].reset_index(drop=True)
+    # BULLETPROOF FILTER: Drop anything with a timestamp greater than the server's current time
+    df['ts'] = df['ts'].astype("int64")
+    df = df[df['ts'] <= now_ms].reset_index(drop=True)
+    df['ts'] = pd.to_datetime(df['ts'], unit="ms")
     
     df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
     tr = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift()), abs(df['l']-df['c'].shift())], axis=1).max(axis=1)
@@ -32,14 +50,24 @@ def fetch_data(inst, limit=10000):
     
     return df
 
-def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
-    eth_df = fetch_data("ETH-USDT-SWAP")
+def run_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=3):
+    print(f"\n=======================================================")
+    print(f"STARTING BACKTEST FOR: {symbol}")
+    print(f"=======================================================")
+    
+    asset_df = fetch_data(symbol)
     btc_df = fetch_data("BTC-USDT-SWAP")
     
-    if len(eth_df) < 60 or len(btc_df) < 60: return
+    if asset_df is None or len(asset_df) < 100:
+        print(f"Not enough data for {symbol}.")
+        return
+    if btc_df is None or len(btc_df) < 100:
+        print("Failed to fetch BTC data.")
+        return
     
+    # Merge BTC macro trend
     btc_trend = btc_df.set_index('ts')[['c', 'ema_50']].rename(columns={'c': 'btc_close', 'ema_50': 'btc_ema'})
-    eth_df = eth_df.join(btc_trend, on='ts').dropna().reset_index(drop=True)
+    asset_df = asset_df.join(btc_trend, on='ts').dropna().reset_index(drop=True)
     
     balance = initial_balance
     trades = []
@@ -50,10 +78,10 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     slippage = 0.0005     
     
     i = lookback + 15
-    while i < len(eth_df) - 50: # Reduced look-ahead to 50 candles (12.5 hours)
-        sweep = eth_df.iloc[i]
-        confirm = eth_df.iloc[i+1]
-        entry_candle = eth_df.iloc[i+2]
+    while i < len(asset_df) - 50:
+        sweep = asset_df.iloc[i]
+        confirm = asset_df.iloc[i+1]
+        entry_candle = asset_df.iloc[i+2]
         
         ema = sweep['ema_50']
         atr = sweep['atr']
@@ -64,8 +92,8 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
         is_bullish = sweep['c'] >= ema
         is_bearish = sweep['c'] < ema
         
-        prior_low = eth_df['l'].iloc[i-lookback:i].min()
-        prior_high = eth_df['h'].iloc[i-lookback:i].max()
+        prior_low = asset_df['l'].iloc[i-lookback:i].min()
+        prior_high = asset_df['h'].iloc[i-lookback:i].max()
         
         btc_is_bullish = sweep['btc_close'] >= sweep['btc_ema']
         btc_is_bearish = sweep['btc_close'] < sweep['btc_ema']
@@ -93,7 +121,6 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
                         entry_price = entry_candle['o'] * (1.0 - slippage)
 
         if side:
-            # CLAUDE'S ATR STOP LOGIC
             if side == "LONG":
                 sl = sweep['l'] - (1.5 * atr)
                 risk_distance = entry_price - sl
@@ -112,14 +139,13 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
                 outcome = "OPEN"
                 exit_price = None
-                max_forward = min(i + 50, len(eth_df) - 1)
+                max_forward = min(i + 50, len(asset_df) - 1)
                 
-                # OUR TRAILING STOP LOGIC
                 current_sl = sl
                 trailing_active = False
                 
                 for j in range(i+3, max_forward):
-                    future = eth_df.iloc[j]
+                    future = asset_df.iloc[j]
                     
                     if side == "LONG":
                         if future['h'] >= tp: 
@@ -147,7 +173,7 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
                 if outcome == "OPEN":
                     outcome = "TIMEOUT"
-                    exit_price = eth_df.iloc[max_forward]['c']
+                    exit_price = asset_df.iloc[max_forward]['c']
 
                 if side == "LONG":
                     pnl = (exit_price - entry_price) * position_size
@@ -161,7 +187,7 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
             i += 1
 
     if not trades:
-        print("\n[ETH-USDT] No valid setups found.")
+        print(f"\n[{symbol}] No valid setups found.")
         return
 
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
@@ -171,21 +197,20 @@ def run_eth_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     
     win_rate = ((wins + trailed) / max(1, wins+losses+trailed)) * 100
     
-    print(f"\n===== ETH 15M BACKTEST (ATR Stops + Trailing) =====")
-    print(f"Total Trades Executed: {len(trades)}")
-    print(f"Wins: {wins} | Trailed: {trailed} | Losses: {losses} | Timeouts: {timeouts}")
+    print(f"===== RESULTS FOR {symbol} =====")
+    print(f"Total Trades: {len(trades)} | Wins: {wins} | Trailed: {trailed} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
     print(f"Macro Filter Blocked Setups: {macro_blocked}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print(f"===================================================")
     
-    print(f"\n===== LAST 5 TRADES =====")
+    print(f"\n--- LAST 5 TRADES ---")
     for t in trades[-5:]:
         time_str = t['time'].strftime('%Y-%m-%d %H:%M')
         print(f"{time_str} | {t['side']:<5} | {t['outcome']:<7} | PnL: ${t['net_pnl']:>7.2f}")
-    print(f"=========================")
+    print(f"=======================================================\n")
 
 if __name__ == "__main__":
-    run_eth_backtest()
+    run_backtest("XRP-USDT-SWAP")
+    run_backtest("HYPE-USDT-SWAP")
