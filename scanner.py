@@ -29,35 +29,28 @@ def fetch_okx_data(inst, limit=1000):
     today = pd.Timestamp.now('UTC').tz_localize(None)
     df = df[df['ts'] <= today].reset_index(drop=True)
     
-    # Calculate 200 EMA Trend Filter on 15m chart
-    df['ema_200'] = df['c'].ewm(span=200, adjust=False).mean()
+    # Calculate 50 EMA Trend Filter (optimized for 15m responsiveness)
+    df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
     return df
 
 # ==========================================
-# 2. FILTERED SMC STRATEGY + REALISTIC EXECUTION
+# 2. OPTIMIZED SMC STRATEGY + EXECUTION
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
-    if len(df) < 200: return
+    if len(df) < 60: return
     
     balance = initial_balance
     trades = []
     
-    i = 200 # Start after EMA has enough history
+    i = 60 # Start after 50 EMA has warmed up
     while i < len(df) - 55:
         sweep_candle = df.iloc[i]
         confirm_candle = df.iloc[i+1]
-        
-        # --- FILTER 1: SESSION TIME FILTER (UTC) ---
-        # Only trade London & New York sessions (07:00 UTC to 20:00 UTC)
-        trade_hour = sweep_candle['ts'].hour
-        if not (7 <= trade_hour <= 20):
-            i += 1
-            continue
 
-        # --- FILTER 2: MACRO TREND FILTER ---
-        # Price must be above the 200 EMA for a Long setup
-        if sweep_candle['c'] < sweep_candle['ema_200']:
+        # --- OPTIMIZED FILTER: MACRO TREND FILTER (50 EMA) ---
+        # Price must be above the 50 EMA for a Long setup
+        if sweep_candle['c'] < sweep_candle['ema_50']:
             i += 1
             continue
 
@@ -140,16 +133,16 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
     # --- PRINT RESULTS ---
     if not trades:
-        print(f"\n[{inst}] No valid filtered SMC setups found.")
+        print(f"\n[{inst}] No valid optimized SMC setups found.")
         return
 
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n============= {inst} FILTERED SMC BACKTEST =============")
-    print(f"Period: {df['ts'].iloc[200].date()} to {df['ts'].iloc[-1].date()}")
-    print(f"Total Trades: {len(trades)} (Filtered for Trend & Session)")
+    print(f"\n========== {inst} OPTIMIZED SMC BACKTEST ==========")
+    print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
+    print(f"Total Trades: {len(trades)}")
     print(f"Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
@@ -164,3 +157,4 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 if __name__ == "__main__":
     run_backtest("BTC-USDT-SWAP")
     run_backtest("SOL-USDT-SWAP")
+    
