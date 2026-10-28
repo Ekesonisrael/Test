@@ -26,31 +26,28 @@ def fetch_data(inst, limit=10000):
     today = pd.Timestamp.now('UTC').tz_localize(None)
     df = df[df['ts'] <= today].reset_index(drop=True)
     
-    # 50 EMA & 14-period ATR
     df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
     tr = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift()), abs(df['l']-df['c'].shift())], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     
     return df
 
-def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
+def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     sol_df = fetch_data("SOL-USDT-SWAP")
     btc_df = fetch_data("BTC-USDT-SWAP")
     
     if len(sol_df) < 60 or len(btc_df) < 60: return
     
-    # Align BTC trend with SOL timestamps
     btc_trend = btc_df.set_index('ts')[['c', 'ema_50']].rename(columns={'c': 'btc_close', 'ema_50': 'btc_ema'})
     sol_df = sol_df.join(btc_trend, on='ts').dropna().reset_index(drop=True)
     
     balance = initial_balance
     trades = []
-    missed_limit_fills = 0
     macro_blocked = 0
     
-    rr_target = 3.0       
+    rr_target = 2.5       # FIXED: Back to our proven winning math
     lookback = 15
-    slippage = 0.0005     
+    slippage = 0.0005     # 0.05% slippage penalty on market fills
     
     i = lookback + 15
     while i < len(sol_df) - 100:
@@ -70,37 +67,30 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
         prior_low = sol_df['l'].iloc[i-lookback:i].min()
         prior_high = sol_df['h'].iloc[i-lookback:i].max()
         
-        # Macro BTC Trend Filter
         btc_is_bullish = sweep['btc_close'] >= sweep['btc_ema']
         btc_is_bearish = sweep['btc_close'] < sweep['btc_ema']
         
         side = None
         
-        # --- LONG SETUP ---
-        if is_bullish and btc_is_bullish:
+        # --- LONG SETUP (Market Execution + Slippage) ---
+        if is_bullish:
             if sweep['l'] < prior_low and sweep['c'] > prior_low:
                 if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
-                    # Realistic Limit: We want to buy slightly below the open on a small dip
-                    limit_price = entry_candle['o'] * 0.999
-                    # LIMIT FILL CHECK: Did the candle's low drop down to our limit price?
-                    if entry_candle['l'] > limit_price:
-                        missed_limit_fills += 1
+                    if not btc_is_bullish:
+                        macro_blocked += 1 # Macro filter saved us
                     else:
                         side = "LONG"
-                        entry_price = limit_price * (1.0 + slippage)
+                        entry_price = entry_candle['o'] * (1.0 + slippage)
                         
-        # --- SHORT SETUP ---
-        elif is_bearish and btc_is_bearish:
+        # --- SHORT SETUP (Market Execution + Slippage) ---
+        elif is_bearish:
             if sweep['h'] > prior_high and sweep['c'] < prior_high:
                 if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
-                    # Realistic Limit: We want to sell slightly above the open on a small bounce
-                    limit_price = entry_candle['o'] * 1.001
-                    # LIMIT FILL CHECK: Did the candle's high rise up to our limit price?
-                    if entry_candle['h'] < limit_price:
-                        missed_limit_fills += 1
+                    if not btc_is_bearish:
+                        macro_blocked += 1 # Macro filter saved us
                     else:
                         side = "SHORT"
-                        entry_price = limit_price * (1.0 - slippage)
+                        entry_price = entry_candle['o'] * (1.0 - slippage)
 
         if side:
             if side == "LONG":
@@ -149,11 +139,7 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
                 trades.append({"time": entry_candle['ts'], "side": side, "outcome": outcome, "net_pnl": pnl})
                 i = j 
         else:
-            if (is_bullish and sweep['l'] < prior_low) or (is_bearish and sweep['h'] > prior_high):
-                if not btc_is_bullish and not btc_is_bearish:
-                    macro_blocked += 1
-                    
-        i += 1
+            i += 1
 
     if not trades:
         print("\n[SOL-USDT] No valid setups found.")
@@ -164,15 +150,14 @@ def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3
     timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
     win_rate = (wins / max(1, wins+losses)) * 100
     
-    print(f"\n===== ULTIMATE SOL BACKTEST (BTC Filter + Limit Fills + Slippage) =====")
+    print(f"\n===== FINAL SOL BACKTEST (Market Execution + BTC Filter) =====")
     print(f"Total Trades Executed: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
-    print(f"Missed Trades (Limit Not Filled): {missed_limit_fills}")
     print(f"Macro Filter Blocked Setups: {macro_blocked}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print("=========================================================================")
+    print("=============================================================")
 
 if __name__ == "__main__":
-    run_ultimate_sol_backtest()
+    run_clean_sol_backtest()
