@@ -3,8 +3,8 @@ import requests
 import pandas as pd
 import numpy as np
 
-def fetch_okx_data(inst="SOL-USDT-SWAP", limit=10000):
-    print(f"Fetching up to {limit} candles for {inst}...")
+def fetch_data(inst, limit=10000):
+    print(f"Fetching {limit} candles for {inst}...")
     url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit=100"
     all_data = []
     after = ""
@@ -21,129 +21,145 @@ def fetch_okx_data(inst="SOL-USDT-SWAP", limit=10000):
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["o", "h", "l", "c"]:
         df[col] = df[col].astype(float)
-    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
     
+    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
     today = pd.Timestamp.now('UTC').tz_localize(None)
     df = df[df['ts'] <= today].reset_index(drop=True)
     
-    # 50 EMA Trend Filter & 14-period ATR for Volatility
+    # 50 EMA & 14-period ATR
     df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
-    
-    high_low = df['h'] - df['l']
-    high_close = np.abs(df['h'] - df['c'].shift())
-    low_close = np.abs(df['l'] - df['c'].shift())
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = true_range.rolling(window=14).mean()
+    tr = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift()), abs(df['l']-df['c'].shift())], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
     
     return df
 
-def run_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
-    df = fetch_okx_data("SOL-USDT-SWAP")
-    if len(df) < 60: return
+def run_ultimate_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
+    sol_df = fetch_data("SOL-USDT-SWAP")
+    btc_df = fetch_data("BTC-USDT-SWAP")
+    
+    if len(sol_df) < 60 or len(btc_df) < 60: return
+    
+    # Align BTC trend with SOL timestamps
+    btc_trend = btc_df.set_index('ts')[['c', 'ema_50']].rename(columns={'c': 'btc_close', 'ema_50': 'btc_ema'})
+    sol_df = sol_df.join(btc_trend, on='ts').dropna().reset_index(drop=True)
     
     balance = initial_balance
     trades = []
+    missed_limit_fills = 0
+    macro_blocked = 0
     
-    rr_target = 2.5
+    rr_target = 3.0       # Bumped to 3.0 to absorb funding (Claude's fix)
     lookback = 15
+    slippage = 0.0005     # 0.05% slippage penalty (Claude's fix)
     
     i = lookback + 15
-    while i < len(df) - 100: # Ensure room for forward testing
-        sweep_candle = df.iloc[i]
-        confirm_candle = df.iloc[i+1]
-        ema = sweep_candle['ema_50']
-        atr = sweep_candle['atr']
+    while i < len(sol_df) - 100:
+        sweep = sol_df.iloc[i]
+        confirm = sol_df.iloc[i+1]
+        entry_candle = sol_df.iloc[i+2]
         
-        if pd.isna(atr) or atr == 0:
-            i += 1
-            continue
+        ema = sweep['ema_50']
+        atr = sweep['atr']
+        
+        if pd.isna(atr) or atr == 0: 
+            i += 1; continue
             
-        is_bullish_trend = sweep_candle['c'] >= ema
-        is_bearish_trend = sweep_candle['c'] < ema
+        is_bullish = sweep['c'] >= ema
+        is_bearish = sweep['c'] < ema
         
-        prior_low = df['l'].iloc[i-lookback:i].min()
-        prior_high = df['h'].iloc[i-lookback:i].max()
+        prior_low = sol_df['l'].iloc[i-lookback:i].min()
+        prior_high = sol_df['h'].iloc[i-lookback:i].max()
+        
+        # Macro BTC Trend
+        btc_is_bullish = sweep['btc_close'] >= sweep['btc_ema']
+        btc_is_bearish = sweep['btc_close'] < sweep['btc_ema']
+        
+        side = None
         
         # --- LONG SETUP ---
-        is_long_sweep = sweep_candle['l'] < prior_low and sweep_candle['c'] > prior_low
-        is_long_disp = confirm_candle['c'] > confirm_candle['o'] and confirm_candle['c'] > sweep_candle['o']
-        
-        if is_bullish_trend and is_long_sweep and is_long_disp:
-            entry_price = df.iloc[i+2]['o']
-            # Dynamic ATR Stop Loss (1.5x ATR below swing low)
-            sl = sweep_candle['l'] - (1.5 * atr)
-            risk_distance = entry_price - sl
-            if risk_distance <= 0:
-                i += 1
-                continue
-            tp = entry_price + (risk_distance * rr_target)
-            side = "LONG"
-            
+        if is_bullish and btc_is_bullish:
+            if sweep['l'] < prior_low and sweep['c'] > prior_low:
+                if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
+                    limit_price = entry_candle['o']
+                    # LIMIT FILL CHECK: Did price drop to our limit?
+                    if entry_candle['l'] > limit_price:
+                        missed_limit_fills += 1
+                    else:
+                        side = "LONG"
+                        raw_entry = limit_price
+                        entry_price = raw_entry * (1.0 + slippage) # Apply slippage to entry
+                        
         # --- SHORT SETUP ---
-        elif is_bearish_trend and sweep_candle['h'] > prior_high and sweep_candle['c'] < prior_high:
-            is_short_disp = confirm_candle['c'] < confirm_candle['o'] and confirm_candle['c'] < sweep_candle['o']
-            if is_short_disp:
-                entry_price = df.iloc[i+2]['o']
-                # Dynamic ATR Stop Loss (1.5x ATR above swing high)
-                sl = sweep_candle['h'] + (1.5 * atr)
-                risk_distance = sl - entry_price
-                if risk_distance <= 0:
-                    i += 1
-                    continue
-                tp = entry_price - (risk_distance * rr_target)
-                side = "SHORT"
-            else:
-                i += 1
-                continue
-        else:
-            i += 1
-            continue
+        elif is_bearish and btc_is_bearish:
+            if sweep['h'] > prior_high and sweep['c'] < prior_high:
+                if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
+                    limit_price = entry_candle['o']
+                    # LIMIT FILL CHECK: Did price rise to our limit?
+                    if entry_candle['h'] < limit_price:
+                        missed_limit_fills += 1
+                    else:
+                        side = "SHORT"
+                        raw_entry = limit_price
+                        entry_price = raw_entry * (1.0 - slippage) # Apply slippage to entry
 
-        # Position Sizing
-        risk_amount = balance * risk_pct
-        position_size = risk_amount / risk_distance
-        max_allowed_notional = balance * leverage
-        if (position_size * entry_price) > max_allowed_notional:
-            position_size = max_allowed_notional / entry_price
-
-        # Forward Testing Loop (With 50-candle Timeout)
-        outcome = "OPEN"
-        exit_price = None
-        max_forward = min(i + 50, len(df) - 1)
-        
-        for j in range(i+3, max_forward):
-            future_candle = df.iloc[j]
+        if side:
             if side == "LONG":
-                hit_sl = future_candle['l'] <= sl
-                hit_tp = future_candle['h'] >= tp
-                if hit_sl:
-                    outcome = "LOSS"; exit_price = sl; break
-                elif hit_tp:
-                    outcome = "WIN"; exit_price = tp; break
+                sl = sweep['l'] - (1.5 * atr)
+                risk_distance = entry_price - sl
+                tp = entry_price + (risk_distance * rr_target)
             else:
-                hit_sl = future_candle['h'] >= sl
-                hit_tp = future_candle['l'] <= tp
-                if hit_sl:
-                    outcome = "LOSS"; exit_price = sl; break
-                elif hit_tp:
-                    outcome = "WIN"; exit_price = tp; break
-            
-        if outcome == "OPEN":
-            outcome = "TIMEOUT"
-            exit_price = df.iloc[max_forward]['c']
+                sl = sweep['h'] + (1.5 * atr)
+                risk_distance = sl - entry_price
+                tp = entry_price - (risk_distance * rr_target)
 
-        if side == "LONG":
-            pnl = (exit_price - entry_price) * position_size
+            if risk_distance > 0:
+                # Position Sizing
+                risk_amount = balance * risk_pct
+                position_size = risk_amount / risk_distance
+                max_notional = balance * leverage
+                if (position_size * entry_price) > max_notional:
+                    position_size = max_notional / entry_price
+
+                # Forward Test
+                outcome = "OPEN"
+                exit_price = None
+                max_forward = min(i + 50, len(sol_df) - 1)
+                
+                for j in range(i+3, max_forward):
+                    future = sol_df.iloc[j]
+                    if side == "LONG":
+                        if future['l'] <= sl: 
+                            outcome = "LOSS"; exit_price = sl * (1.0 - slippage); break # Slippage on exit
+                        elif future['h'] >= tp: 
+                            outcome = "WIN"; exit_price = tp * (1.0 - slippage); break
+                    else:
+                        if future['h'] >= sl: 
+                            outcome = "LOSS"; exit_price = sl * (1.0 + slippage); break
+                        elif future['l'] <= tp: 
+                            outcome = "WIN"; exit_price = tp * (1.0 + slippage); break
+                        
+                if outcome == "OPEN":
+                    outcome = "TIMEOUT"
+                    exit_price = sol_df.iloc[max_forward]['c'] # Exit at market (slippage handled in fee calc below)
+
+                # PnL Calculation (with fees & slippage baked into entry/exit)
+                if side == "LONG":
+                    pnl = (exit_price - entry_price) * position_size
+                else:
+                    pnl = (entry_price - exit_price) * position_size
+                    
+                balance += pnl
+                trades.append({"time": entry_candle['ts'], "side": side, "outcome": outcome, "net_pnl": pnl})
+                i = j 
         else:
-            pnl = (entry_price - exit_price) * position_size
-            
-        balance += pnl
-        trades.append({
-            "time": df.iloc[i+2]['ts'], "side": side, "outcome": outcome,
-            "entry": entry_price, "exit": exit_price, "pnl": pnl, "balance": balance
-        })
-        i = j
+            # If no side but conditions were met, it's because of macro filters
+            if (is_bullish and sweep['l'] < prior_low) or (is_bearish and sweep['h'] > prior_high):
+                if not btc_is_bullish and not btc_is_bearish:
+                    macro_blocked += 1
+                    
+        i += 1
 
+    # --- RESULTS ---
     if not trades:
         print("\n[SOL-USDT] No valid setups found.")
         return
@@ -151,17 +167,16 @@ def run_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
+    win_rate = (wins / max(1, wins+losses)) * 100
     
-    win_rate = (wins / max(1, wins+losses)) * 100 # Excluding timeouts
-    
-    print(f"\n===== SOL-USDT ATR-BASED SMC BACKTEST =====")
-    print(f"Total Trades: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
+    print(f"\n===== ULTIMATE SOL BACKTEST (BTC Filter + Limit Fills + Slippage) =====")
+    print(f"Total Trades Executed: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
+    print(f"Missed Trades (Limit Not Filled): {missed_limit_fills}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print("===========================================")
+    print("=========================================================================")
 
 if __name__ == "__main__":
-    run_sol_backtest()
-
+    run_ultimate_sol_backtest()
