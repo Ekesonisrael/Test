@@ -34,7 +34,7 @@ def fetch_okx_data(inst, limit=3000):
     return df
 
 # ==========================================
-# 2. ASSET-SPECIFIC BUFFER & R:R STRATEGY
+# 2. FIXED TIMEOUT CLASSIFICATION STRATEGY
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
@@ -118,9 +118,10 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
                     exit_price = tp
                     break
             
+            # Fixed Timeout Handling: explicitly label time-expansions as TIMEOUT
             if outcome == "TIMEOUT":
                 exit_price = df.iloc[end_lookahead-1]['c']
-                outcome = "WIN" if exit_price > entry_price else "LOSS"
+                outcome = "TIMEOUT"
 
             pnl = (exit_price - entry_price) * position_size
             balance += pnl
@@ -145,12 +146,13 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
+    timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} ASSET-SPECIFIC R:R BACKTEST =====")
+    print(f"\n===== {inst} CLEAN TIMEOUT BACKTEST =====")
     print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
     print(f"Total Trades: {len(trades)}")
-    print(f"Wins: {wins} | Losses: {losses}")
+    print(f"Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
