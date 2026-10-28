@@ -2,7 +2,6 @@
 import requests
 import pandas as pd
 import numpy as np
-import sys
 
 # ==========================================
 # 1. RISK MANAGEMENT CORE
@@ -18,7 +17,7 @@ class RiskManager:
         if distance == 0: return 0
         return risk_amount / distance
 
-    def validate_trade(self, entry, stop_loss, take_profit, action):
+    def validate_trade(self, entry, stop_loss, take_profit):
         risk = abs(entry - stop_loss)
         reward = abs(take_profit - entry)
         
@@ -27,104 +26,92 @@ class RiskManager:
             
         rr = reward / risk
         if rr < 2.0: 
-            return False, f"R:R ratio {rr:.2f} is below the 2.0 minimum.", rr
+            return False, f"R:R {rr:.2f} < 2.0", rr
             
         return True, "Approved", rr
 
 # ==========================================
-# 2. DATA ENGINE (Free OKX API)
+# 2. DATA ENGINE (Free OKX API - Paginated)
 # ==========================================
-def fetch_data(symbol):
-    """Fetches latest 15m candles (max 100 per request)."""
-    url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=15m&limit=100"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()["data"]
-        df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
-        df = df.iloc[::-1].reset_index(drop=True) # Reverse to chronological
-        for col in ["o", "h", "l", "c"]:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return None
+def fetch_data(symbol, limit=1000):
+    """Fetches up to 1000 historical 15m candles."""
+    print(f"Fetching {limit} candles for {symbol}...")
+    all_data = []
+    after = ""
+    
+    while len(all_data) < limit:
+        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=15m&limit=100"
+        if after:
+            url += f"&after={after}"
+            
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()["data"]
+            if not data: break
+            all_data.extend(data)
+            after = data[-1][0]
+        except Exception as e:
+            print(f"Error: {e}")
+            break
+            
+    df = pd.DataFrame(all_data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
+    df = df.iloc[::-1].reset_index(drop=True)
+    for col in ["o", "h", "l", "c"]:
+        df[col] = df[col].astype(float)
+    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
+    return df
 
 # ==========================================
-# 3. STRATEGY ENGINE (SMC Liquidity Sweep)
+# 3. STRATEGY ENGINE (Historical Backtest)
 # ==========================================
-def scan_smc(df):
-    """Scans the last 15 candles for a Liquidity Sweep and Order Block."""
-    recent = df.tail(20).copy()
+def backtest_smc(df):
+    """Scans the ENTIRE dataset for Liquidity Sweeps."""
+    setups_found = 0
+    setups_approved = 0
+    risk = RiskManager()
     
-    # Find the swing low of the 5 candles before the recent price action
-    prior_swing_low = recent['l'].iloc[0:15].min()
-    
-    # We look at the last 3 candles to see if a sweep just happened
-    for i in range(len(recent)-3, len(recent)):
-        candle = recent.iloc[i]
+    # We start at candle 15 so we have history to look back at
+    for i in range(15, len(df) - 1):
+        candle = df.iloc[i]
         
-        # SWEEP LOGIC: Wick breaks the prior low, but closes back above it.
-        if candle['l'] < prior_swing_low and candle['c'] > prior_swing_low:
+        # 1. LIQUIDITY SWEEP LOGIC
+        # Find lowest low of the 10 candles prior to this one
+        prior_low = df['l'].iloc[i-10:i].min()
+        
+        # Did this candle sweep the low but close above it?
+        if candle['l'] < prior_low and candle['c'] > prior_low:
             
-            # ORDER BLOCK LOGIC: Find the last bearish candle before the sweep
+            # 2. ORDER BLOCK LOGIC
+            # Last bearish candle before the sweep
             ob_high, ob_low = candle['o'], candle['l']
             for j in range(i-1, max(0, i-6), -1):
-                if recent['c'].iloc[j] < recent['o'].iloc[j]: # Bearish candle
-                    ob_high = recent['h'].iloc[j]
-                    ob_low = recent['l'].iloc[j]
+                if df['c'].iloc[j] < df['o'].iloc[j]:
+                    ob_high = df['h'].iloc[j]
+                    ob_low = df['l'].iloc[j]
                     break
             
             entry = ob_high
-            sl = candle['l'] * 0.999 # 0.1% buffer below the sweep wick
-            tp = recent['h'].iloc[0:15].max() # The previous swing high (liquidity target)
+            sl = candle['l'] * 0.999 # Stop below the sweep wick
+            tp = df['h'].iloc[i-10:i].max() # Target previous swing high
             
-            return {
-                "signal": "BUY",
-                "sweep_time": pd.to_datetime(int(candle['ts']), unit="ms"),
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "ob_zone": f"{ob_low:.2f} - {ob_high:.2f}"
-            }
-    return None
-
-# ==========================================
-# 4. MAIN EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    print("=== STARTING SMC LIQUIDITY SCANNER ===")
-    
-    risk_engine = RiskManager(account_balance=10000.0)
-    watchlist = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-    
-    found_trades = 0
-    
-    for symbol in watchlist:
-        df = fetch_data(symbol)
-        if df is None or len(df) < 20:
-            continue
+            setups_found += 1
             
-        current_price = df['c'].iloc[-1]
-        print(f"\n[{symbol}] Current Price: ${current_price:.2f}")
-        
-        setup = scan_smc(df)
-        
-        if setup:
-            print(f"  🔥 LIQUIDITY SWEEP DETECTED at {setup['sweep_time']}")
-            print(f"  Order Block Zone: {setup['ob_zone']}")
-            print(f"  Entry: ${setup['entry']:.2f} | SL: ${setup['sl']:.2f} | TP: ${setup['tp']:.2f}")
-            
-            # Pass to Risk Engine
-            approved, reason, rr = risk_engine.validate_trade(setup['entry'], setup['sl'], setup['tp'], "BUY")
+            # 3. RISK VALIDATION
+            approved, reason, rr = risk.validate_trade(entry, sl, tp)
             
             if approved:
-                size = risk_engine.calculate_position_size(setup['entry'], setup['sl'])
-                print(f"  ✅ TRADE APPROVED (R:R {rr:.2f})")
-                print(f"  -> Execute BUY for {size:.4f} contracts at ${setup['entry']:.2f}")
-                found_trades += 1
+                size = risk.calculate_position_size(entry, sl)
+                setups_approved += 1
+                print(f"[{candle['ts']}] 🟢 SWEEP & OB FOUND | Entry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f} | R:R {rr:.2f} | Size: {size:.2f}")
             else:
-                print(f"  ❌ TRADE REJECTED: {reason}")
-        else:
-            print("  No recent sweep setups found.")
-            
-    print(f"\n=== SCAN COMPLETE. Found {found_trades} valid setups. ===")
+                # Only print rejects if they were actual sweeps but failed R:R
+                print(f"[{candle['ts']}] 🔴 SWEEP FOUND BUT REJECTED: {reason}")
+
+    print("\n=== BACKTEST COMPLETE ===")
+    print(f"Total Sweeps Found: {setups_found}")
+    print(f"Trades Approved by Risk Engine: {setups_approved}")
+    print(f"Rejection Rate: {100 - (setups_approved/max(1, setups_found)*100):.1f}%")
+
+if __name__ == "__main__":
+    df = fetch_data("BTC-USDT-SWAP", limit=1000)
+    backtest_smc(df)
