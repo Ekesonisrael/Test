@@ -4,10 +4,10 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 1. DATA ENGINE (3000 Candles)
+# 1. DATA ENGINE (Expanded to 10,000 Candles)
 # ==========================================
-def fetch_okx_data(inst, limit=3000):
-    print(f"Fetching {limit} candles for {inst}...")
+def fetch_okx_data(inst, limit=10000):
+    print(f"Fetching up to {limit} candles for {inst}...")
     url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit=100"
     all_data = []
     after = ""
@@ -34,7 +34,7 @@ def fetch_okx_data(inst, limit=3000):
     return df
 
 # ==========================================
-# 2. UNCONSTRAINED HOLDING STRATEGY
+# 2. PROVEN BTC SMC STRATEGY (10K CANDLES)
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
@@ -43,13 +43,13 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     balance = initial_balance
     trades = []
     
-    # Asset-specific stop-loss cushion and R:R target mapping
+    # Asset-specific configuration
     if "SOL" in inst:
-        sl_buffer = 0.988  # 1.2% below sweep low for SOL's volatile wicks
-        rr_target = 3.0    # Balanced 1:3 target
+        sl_buffer = 0.988
+        rr_target = 3.0
     else:
         sl_buffer = 0.997  # 0.3% below sweep low for BTC
-        rr_target = 2.0    # Balanced 1:2 target for BTC to ensure high hit rate
+        rr_target = 2.0    # 1:2 R:R target for BTC
     
     i = 60
     while i < len(df) - 10:
@@ -75,10 +75,8 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
                 break
             entry_price = df.iloc[i+2]['o']
             
-            # Asset-adjusted Stop Loss
+            # Stop Loss & Take Profit
             sl = sweep_candle['l'] * sl_buffer
-            
-            # Take Profit Target
             risk_distance = entry_price - sl
             if risk_distance <= 0:
                 i += 1
@@ -94,7 +92,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
             if (position_size * entry_price) > max_allowed_notional:
                 position_size = max_allowed_notional / entry_price
             
-            # 3. FORWARD TESTING (Hold until TP or SL is genuinely hit)
+            # 3. FORWARD TESTING (Hold until TP or SL is hit)
             outcome = None
             exit_price = None
             
@@ -120,7 +118,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
                 j += 1
             
             if outcome is None:
-                break # Reached end of dataset while in a trade
+                break
 
             pnl = (exit_price - entry_price) * position_size
             balance += pnl
@@ -147,7 +145,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} FULL RESOLUTION BACKTEST =====")
+    print(f"\n===== {inst} 10,000 CANDLE EXTENSIVE BACKTEST =====")
     print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
     print(f"Total Trades: {len(trades)}")
     print(f"Wins: {wins} | Losses: {losses}")
@@ -163,4 +161,3 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
 if __name__ == "__main__":
     run_backtest("BTC-USDT-SWAP")
-    run_backtest("SOL-USDT-SWAP")
