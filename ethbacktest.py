@@ -3,10 +3,9 @@ import requests
 import pandas as pd
 import numpy as np
 
-def fetch_data(inst, limit=10000):
-    print(f"Fetching {limit} candles for {inst}...")
-    # We switch to 1H timeframe to avoid 15m noise
-    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=1H&limit=100"
+def fetch_data(inst, limit=2000):
+    print(f"Fetching {limit} candles for {inst} (4H Timeframe)...")
+    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=4H&limit=100"
     all_data = []
     after = ""
     
@@ -23,10 +22,7 @@ def fetch_data(inst, limit=10000):
     for col in ["o", "h", "l", "c"]:
         df[col] = df[col].astype(float)
     
-    # HARDCODED DATE LOCK (No more 2026 glitches!)
     df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
-    safe_cutoff = pd.Timestamp('2024-05-20') # Hard stop
-    df = df[df['ts'] <= safe_cutoff].reset_index(drop=True)
     
     # Indicators
     df['ema_9'] = df['c'].ewm(span=9, adjust=False).mean()
@@ -38,23 +34,24 @@ def fetch_data(inst, limit=10000):
     
     return df
 
-def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=3):
+def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.02, leverage=3):
     print(f"\n=======================================================")
     print(f"STARTING TREND BACKTEST FOR: {symbol}")
     print(f"=======================================================")
     
     df = fetch_data(symbol)
+    
+    # CRITICAL FIX: Ensure we actually have data before running
     if df is None or len(df) < 200:
-        print("Not enough data.")
+        print(f"Error: Only fetched {len(df) if df is not None else 0} candles. Cannot calculate 200 EMA.")
         return
     
     balance = initial_balance
     trades = []
-    
     slippage = 0.0005     
     
-    i = 200 # Start after EMAs are calculated
-    while i < len(df) - 100:
+    i = 200 
+    while i < len(df) - 50: # Shorter look-ahead for 4H
         current = df.iloc[i]
         prev = df.iloc[i-1]
         atr = current['atr']
@@ -67,12 +64,12 @@ def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=
         cross_down = (prev['ema_9'] >= prev['ema_21']) and (current['ema_9'] < current['ema_21'])
         
         side = None
-        entry_price = current['c'] * (1.0 + slippage) # Buy at close of crossover candle
+        entry_price = current['c'] * (1.0 + slippage) 
         
         # LONG ENTRY
         if cross_up and current['c'] > current['ema_200']:
             side = "LONG"
-            sl = entry_price - (2.0 * atr) # 2x ATR stop
+            sl = entry_price - (2.0 * atr) 
             
         # SHORT ENTRY
         elif cross_down and current['c'] < current['ema_200']:
@@ -91,7 +88,7 @@ def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=
 
             outcome = "OPEN"
             exit_price = None
-            max_forward = min(i + 200, len(df) - 1) # Give trend 200 hours to play out
+            max_forward = min(i + 50, len(df) - 1) 
             
             current_sl = sl
             
@@ -99,19 +96,16 @@ def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=
                 future = df.iloc[j]
                 
                 if side == "LONG":
-                    # Trailing Stop: Move SL up as price goes up
                     if future['c'] > entry_price:
                         current_sl = max(current_sl, future['c'] - (2.0 * atr))
-                        
                     if future['l'] <= current_sl:
-                        outcome = "TRAILED/STOP"; exit_price = current_sl * (1.0 - slippage); break
+                        outcome = "TRAILED"; exit_price = current_sl * (1.0 - slippage); break
                         
                 else: # SHORT
                     if future['c'] < entry_price:
                         current_sl = min(current_sl, future['c'] + (2.0 * atr))
-                        
                     if future['h'] >= current_sl:
-                        outcome = "TRAILED/STOP"; exit_price = current_sl * (1.0 + slippage); break
+                        outcome = "TRAILED"; exit_price = current_sl * (1.0 + slippage); break
 
             if outcome == "OPEN":
                 outcome = "TIMEOUT"
@@ -136,7 +130,7 @@ def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=
     losses = sum(1 for t in trades if t['net_pnl'] <= 0)
     win_rate = (wins / len(trades)) * 100
     
-    print(f"===== RESULTS FOR {symbol} =====")
+    print(f"===== RESULTS FOR {symbol} (4H Trend) =====")
     print(f"Total Trades: {len(trades)} | Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
@@ -151,4 +145,6 @@ def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=
 
 if __name__ == "__main__":
     run_trend_backtest("XRP-USDT-SWAP")
-    run_trend_backtest("HYPE-USDT-SWAP")
+    # HYPE doesn't have enough data for a 200 EMA on 4H. 
+    # We will skip HYPE for now until it has more history.
+    # run_trend_backtest("HYPE-USDT-SWAP")
