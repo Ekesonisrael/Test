@@ -2,205 +2,143 @@
 import requests
 import pandas as pd
 import numpy as np
-import time
-
-def get_server_time_ms():
-    """Fetches the exact current time from OKX to prevent future-data glitches."""
-    try:
-        r = requests.get("https://www.okx.com/api/v5/public/time", timeout=5).json()
-        return int(r["data"][0]["ts"])
-    except Exception:
-        return int(time.time() * 1000)
 
 def fetch_data(inst, limit=10000):
     print(f"Fetching {limit} candles for {inst}...")
-    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit=100"
+    # We switch to 1H timeframe to avoid 15m noise
+    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=1H&limit=100"
     all_data = []
     after = ""
     
-    now_ms = get_server_time_ms()
-    
     while len(all_data) < limit:
         req_url = url + (f"&after={after}" if after else "")
-        try:
-            r = requests.get(req_url, timeout=10).json()
-            if r["code"] != "0" or not r["data"]: break
-            all_data.extend(r["data"])
-            after = r["data"][-1][0]
-            if len(r["data"]) < 100: break
-        except Exception:
-            break
-        
-    if not all_data:
-        return None
+        r = requests.get(req_url, timeout=10).json()
+        if r["code"] != "0" or not r["data"]: break
+        all_data.extend(r["data"])
+        after = r["data"][-1][0]
+        if len(r["data"]) < 100: break
         
     df = pd.DataFrame(all_data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["o", "h", "l", "c"]:
         df[col] = df[col].astype(float)
     
-    # BULLETPROOF FILTER: Drop anything with a timestamp greater than the server's current time
-    df['ts'] = df['ts'].astype("int64")
-    df = df[df['ts'] <= now_ms].reset_index(drop=True)
-    df['ts'] = pd.to_datetime(df['ts'], unit="ms")
+    # HARDCODED DATE LOCK (No more 2026 glitches!)
+    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
+    safe_cutoff = pd.Timestamp('2024-05-20') # Hard stop
+    df = df[df['ts'] <= safe_cutoff].reset_index(drop=True)
     
-    df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
+    # Indicators
+    df['ema_9'] = df['c'].ewm(span=9, adjust=False).mean()
+    df['ema_21'] = df['c'].ewm(span=21, adjust=False).mean()
+    df['ema_200'] = df['c'].ewm(span=200, adjust=False).mean()
+    
     tr = pd.concat([df['h']-df['l'], abs(df['h']-df['c'].shift()), abs(df['l']-df['c'].shift())], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     
     return df
 
-def run_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=3):
+def run_trend_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     print(f"\n=======================================================")
-    print(f"STARTING BACKTEST FOR: {symbol}")
+    print(f"STARTING TREND BACKTEST FOR: {symbol}")
     print(f"=======================================================")
     
-    asset_df = fetch_data(symbol)
-    btc_df = fetch_data("BTC-USDT-SWAP")
-    
-    if asset_df is None or len(asset_df) < 100:
-        print(f"Not enough data for {symbol}.")
+    df = fetch_data(symbol)
+    if df is None or len(df) < 200:
+        print("Not enough data.")
         return
-    if btc_df is None or len(btc_df) < 100:
-        print("Failed to fetch BTC data.")
-        return
-    
-    # Merge BTC macro trend
-    btc_trend = btc_df.set_index('ts')[['c', 'ema_50']].rename(columns={'c': 'btc_close', 'ema_50': 'btc_ema'})
-    asset_df = asset_df.join(btc_trend, on='ts').dropna().reset_index(drop=True)
     
     balance = initial_balance
     trades = []
-    macro_blocked = 0
     
-    rr_target = 2.5       
-    lookback = 15
     slippage = 0.0005     
     
-    i = lookback + 15
-    while i < len(asset_df) - 50:
-        sweep = asset_df.iloc[i]
-        confirm = asset_df.iloc[i+1]
-        entry_candle = asset_df.iloc[i+2]
-        
-        ema = sweep['ema_50']
-        atr = sweep['atr']
+    i = 200 # Start after EMAs are calculated
+    while i < len(df) - 100:
+        current = df.iloc[i]
+        prev = df.iloc[i-1]
+        atr = current['atr']
         
         if pd.isna(atr) or atr == 0: 
             i += 1; continue
             
-        is_bullish = sweep['c'] >= ema
-        is_bearish = sweep['c'] < ema
-        
-        prior_low = asset_df['l'].iloc[i-lookback:i].min()
-        prior_high = asset_df['h'].iloc[i-lookback:i].max()
-        
-        btc_is_bullish = sweep['btc_close'] >= sweep['btc_ema']
-        btc_is_bearish = sweep['btc_close'] < sweep['btc_ema']
+        # CROSSOVER LOGIC
+        cross_up = (prev['ema_9'] <= prev['ema_21']) and (current['ema_9'] > current['ema_21'])
+        cross_down = (prev['ema_9'] >= prev['ema_21']) and (current['ema_9'] < current['ema_21'])
         
         side = None
+        entry_price = current['c'] * (1.0 + slippage) # Buy at close of crossover candle
         
-        # --- LONG SETUP ---
-        if is_bullish:
-            if sweep['l'] < prior_low and sweep['c'] > prior_low:
-                if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
-                    if not btc_is_bullish:
-                        macro_blocked += 1
-                    else:
-                        side = "LONG"
-                        entry_price = entry_candle['o'] * (1.0 + slippage)
-                        
-        # --- SHORT SETUP ---
-        elif is_bearish:
-            if sweep['h'] > prior_high and sweep['c'] < prior_high:
-                if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
-                    if not btc_is_bearish:
-                        macro_blocked += 1
-                    else:
-                        side = "SHORT"
-                        entry_price = entry_candle['o'] * (1.0 - slippage)
-
+        # LONG ENTRY
+        if cross_up and current['c'] > current['ema_200']:
+            side = "LONG"
+            sl = entry_price - (2.0 * atr) # 2x ATR stop
+            
+        # SHORT ENTRY
+        elif cross_down and current['c'] < current['ema_200']:
+            side = "SHORT"
+            entry_price = current['c'] * (1.0 - slippage)
+            sl = entry_price + (2.0 * atr)
+            
         if side:
-            if side == "LONG":
-                sl = sweep['l'] - (1.5 * atr)
-                risk_distance = entry_price - sl
-                tp = entry_price + (risk_distance * rr_target)
-            else:
-                sl = sweep['h'] + (1.5 * atr)
-                risk_distance = sl - entry_price
-                tp = entry_price - (risk_distance * rr_target)
+            risk_distance = abs(entry_price - sl)
+            risk_amount = balance * risk_pct
+            position_size = risk_amount / risk_distance
+            max_notional = balance * leverage
+            
+            if (position_size * entry_price) > max_notional:
+                position_size = max_notional / entry_price
 
-            if risk_distance > 0:
-                risk_amount = balance * risk_pct
-                position_size = risk_amount / risk_distance
-                max_notional = balance * leverage
-                if (position_size * entry_price) > max_notional:
-                    position_size = max_notional / entry_price
-
-                outcome = "OPEN"
-                exit_price = None
-                max_forward = min(i + 50, len(asset_df) - 1)
+            outcome = "OPEN"
+            exit_price = None
+            max_forward = min(i + 200, len(df) - 1) # Give trend 200 hours to play out
+            
+            current_sl = sl
+            
+            for j in range(i+1, max_forward):
+                future = df.iloc[j]
                 
-                current_sl = sl
-                trailing_active = False
-                
-                for j in range(i+3, max_forward):
-                    future = asset_df.iloc[j]
-                    
-                    if side == "LONG":
-                        if future['h'] >= tp: 
-                            outcome = "WIN"; exit_price = tp * (1.0 - slippage); break
-                        if trailing_active and future['l'] <= current_sl:
-                            outcome = "TRAILED"; exit_price = current_sl * (1.0 - slippage); break
-                        if not trailing_active and future['l'] <= sl:
-                            outcome = "LOSS"; exit_price = sl * (1.0 - slippage); break
-                            
-                        if future['h'] >= entry_price + (risk_distance * 1.5):
-                            trailing_active = True
-                            current_sl = max(current_sl, entry_price + (risk_distance * 0.5))
-                            
-                    else: # SHORT
-                        if future['l'] <= tp: 
-                            outcome = "WIN"; exit_price = tp * (1.0 + slippage); break
-                        if trailing_active and future['h'] >= current_sl:
-                            outcome = "TRAILED"; exit_price = current_sl * (1.0 + slippage); break
-                        if not trailing_active and future['h'] >= sl:
-                            outcome = "LOSS"; exit_price = sl * (1.0 + slippage); break
-                            
-                        if future['l'] <= entry_price - (risk_distance * 1.5):
-                            trailing_active = True
-                            current_sl = min(current_sl, entry_price - (risk_distance * 0.5))
-
-                if outcome == "OPEN":
-                    outcome = "TIMEOUT"
-                    exit_price = asset_df.iloc[max_forward]['c']
-
                 if side == "LONG":
-                    pnl = (exit_price - entry_price) * position_size
-                else:
-                    pnl = (entry_price - exit_price) * position_size
-                    
-                balance += pnl
-                trades.append({"time": entry_candle['ts'], "side": side, "outcome": outcome, "net_pnl": pnl})
-                i = j 
+                    # Trailing Stop: Move SL up as price goes up
+                    if future['c'] > entry_price:
+                        current_sl = max(current_sl, future['c'] - (2.0 * atr))
+                        
+                    if future['l'] <= current_sl:
+                        outcome = "TRAILED/STOP"; exit_price = current_sl * (1.0 - slippage); break
+                        
+                else: # SHORT
+                    if future['c'] < entry_price:
+                        current_sl = min(current_sl, future['c'] + (2.0 * atr))
+                        
+                    if future['h'] >= current_sl:
+                        outcome = "TRAILED/STOP"; exit_price = current_sl * (1.0 + slippage); break
+
+            if outcome == "OPEN":
+                outcome = "TIMEOUT"
+                exit_price = df.iloc[max_forward]['c']
+
+            if side == "LONG":
+                pnl = (exit_price - entry_price) * position_size
+            else:
+                pnl = (entry_price - exit_price) * position_size
+                
+            balance += pnl
+            trades.append({"time": current['ts'], "side": side, "outcome": outcome, "net_pnl": pnl})
+            i = j 
         else:
             i += 1
 
     if not trades:
-        print(f"\n[{symbol}] No valid setups found.")
+        print(f"[{symbol}] No valid setups found.")
         return
 
-    wins = sum(1 for t in trades if t['outcome'] == 'WIN')
-    losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
-    trailed = sum(1 for t in trades if t['outcome'] == 'TRAILED')
-    timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
-    
-    win_rate = ((wins + trailed) / max(1, wins+losses+trailed)) * 100
+    wins = sum(1 for t in trades if t['net_pnl'] > 0)
+    losses = sum(1 for t in trades if t['net_pnl'] <= 0)
+    win_rate = (wins / len(trades)) * 100
     
     print(f"===== RESULTS FOR {symbol} =====")
-    print(f"Total Trades: {len(trades)} | Wins: {wins} | Trailed: {trailed} | Losses: {losses} | Timeouts: {timeouts}")
-    print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
-    print(f"Macro Filter Blocked Setups: {macro_blocked}")
+    print(f"Total Trades: {len(trades)} | Wins: {wins} | Losses: {losses}")
+    print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
@@ -208,9 +146,9 @@ def run_backtest(symbol, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     print(f"\n--- LAST 5 TRADES ---")
     for t in trades[-5:]:
         time_str = t['time'].strftime('%Y-%m-%d %H:%M')
-        print(f"{time_str} | {t['side']:<5} | {t['outcome']:<7} | PnL: ${t['net_pnl']:>7.2f}")
+        print(f"{time_str} | {t['side']:<5} | {t['outcome']:<12} | PnL: ${t['net_pnl']:>7.2f}")
     print(f"=======================================================\n")
 
 if __name__ == "__main__":
-    run_backtest("XRP-USDT-SWAP")
-    run_backtest("HYPE-USDT-SWAP")
+    run_trend_backtest("XRP-USDT-SWAP")
+    run_trend_backtest("HYPE-USDT-SWAP")
