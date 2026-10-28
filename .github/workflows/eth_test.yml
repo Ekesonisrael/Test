@@ -1,0 +1,29 @@
+name: ETH Backtest
+
+on:
+  workflow_dispatch: # Allows you to trigger it manually from GitHub UI
+  push:
+    paths:
+      - 'ethbacktest.py' # Runs automatically if you change the ETH script
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+          
+      - name: Run ETH Backtest Script
+        run: python ethbacktest.py
