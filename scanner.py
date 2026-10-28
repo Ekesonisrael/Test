@@ -34,7 +34,7 @@ def fetch_okx_data(inst, limit=10000):
     return df
 
 # ==========================================
-# 2. PROVEN BASELINE SMC STRATEGY (+7% VERSION)
+# 2. DUAL-SIDED (LONG & SHORT) SMC STRATEGY
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
@@ -43,95 +43,103 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     balance = initial_balance
     trades = []
     
-    sl_buffer = 0.997  # 0.3% below sweep low
+    sl_buffer = 0.003  # 0.3% buffer distance
     rr_target = 2.0    # 1:2 R:R target
     
     i = 60
     while i < len(df) - 10:
         sweep_candle = df.iloc[i]
         confirm_candle = df.iloc[i+1]
-
-        # Macro Trend Filter (50 EMA)
-        if sweep_candle['c'] < sweep_candle['ema_50']:
-            i += 1
-            continue
-
-        # 15-Candle Lookback
+        ema = sweep_candle['ema_50']
+        
+        # Determine Trend Direction
+        is_bullish_trend = sweep_candle['c'] >= ema
+        is_bearish_trend = sweep_candle['c'] < ema
+        
+        # Lookback for Liquidity
         prior_low = df['l'].iloc[i-15:i].min()
+        prior_high = df['h'].iloc[i-15:i].max()
         
-        # 1. LIQUIDITY SWEEP
-        is_sweep = sweep_candle['l'] < prior_low and sweep_candle['c'] > prior_low
+        # --- LONG SETUP ---
+        is_long_sweep = sweep_candle['l'] < prior_low and sweep_candle['c'] > prior_low
+        is_long_disp = confirm_candle['c'] > confirm_candle['o'] and confirm_candle['c'] > sweep_candle['o']
         
-        # 2. DISPLACEMENT
-        is_displacement = confirm_candle['c'] > confirm_candle['o'] and confirm_candle['c'] > sweep_candle['o']
-        
-        if is_sweep and is_displacement:
-            if i + 2 >= len(df):
-                break
+        if is_bullish_trend and is_long_sweep and is_long_disp:
+            if i + 2 >= len(df): break
             entry_price = df.iloc[i+2]['o']
-            
-            # Stop Loss & Take Profit
-            sl = sweep_candle['l'] * sl_buffer
+            sl = sweep_candle['l'] * (1.0 - sl_buffer)
             risk_distance = entry_price - sl
             if risk_distance <= 0:
                 i += 1
                 continue
-                
             tp = entry_price + (risk_distance * rr_target)
+            side = "LONG"
             
-            # ISOLATED POSITION SIZING
-            risk_amount = balance * risk_pct
-            position_size = risk_amount / risk_distance
-            max_allowed_notional = balance * leverage
-            
-            if (position_size * entry_price) > max_allowed_notional:
-                position_size = max_allowed_notional / entry_price
-            
-            # 3. FORWARD TESTING (Hold until TP or SL is hit)
-            outcome = None
-            exit_price = None
-            
-            j = i + 2
-            while j < len(df):
-                future_candle = df.iloc[j]
-                
-                hit_sl = future_candle['l'] <= sl
-                hit_tp = future_candle['h'] >= tp
-                
-                if hit_sl and hit_tp:
-                    outcome = "LOSS"
-                    exit_price = sl
-                    break
-                elif hit_sl:
-                    outcome = "LOSS"
-                    exit_price = sl
-                    break
-                elif hit_tp:
-                    outcome = "WIN"
-                    exit_price = tp
-                    break
-                j += 1
-            
-            if outcome is None:
-                break
-
-            pnl = (exit_price - entry_price) * position_size
-            balance += pnl
-            
-            trades.append({
-                "time": df.iloc[i+2]['ts'],
-                "outcome": outcome,
-                "entry": entry_price,
-                "exit": exit_price,
-                "pnl": pnl,
-                "balance": balance
-            })
-            
-            i = j
+        # --- SHORT SETUP ---
+        elif is_bearish_trend and sweep_candle['h'] > prior_high and sweep_candle['c'] < prior_high:
+            is_short_disp = confirm_candle['c'] < confirm_candle['o'] and confirm_candle['c'] < sweep_candle['o']
+            if is_short_disp:
+                if i + 2 >= len(df): break
+                entry_price = df.iloc[i+2]['o']
+                sl = sweep_candle['h'] * (1.0 + sl_buffer)
+                risk_distance = sl - entry_price
+                if risk_distance <= 0:
+                    i += 1
+                    continue
+                tp = entry_price - (risk_distance * rr_target)
+                side = "SHORT"
+            else:
+                i += 1
+                continue
         else:
             i += 1
+            continue
 
-    # --- PRINT RESULTS ---
+        # Position Sizing
+        risk_amount = balance * risk_pct
+        position_size = risk_amount / risk_distance
+        max_allowed_notional = balance * leverage
+        if (position_size * entry_price) > max_allowed_notional:
+            position_size = max_allowed_notional / entry_price
+
+        # Forward Testing Loop
+        outcome = None
+        exit_price = None
+        j = i + 2
+        while j < len(df):
+            future_candle = df.iloc[j]
+            if side == "LONG":
+                hit_sl = future_candle['l'] <= sl
+                hit_tp = future_candle['h'] >= tp
+                if hit_sl:
+                    outcome = "LOSS"; exit_price = sl; break
+                elif hit_tp:
+                    outcome = "WIN"; exit_price = tp; break
+            else:  # SHORT
+                hit_sl = future_candle['h'] >= sl
+                hit_tp = future_candle['l'] <= tp
+                if hit_sl:
+                    outcome = "LOSS"; exit_price = sl; break
+                elif hit_tp:
+                    outcome = "WIN"; exit_price = tp; break
+            j += 1
+            
+        if outcome is None: break
+
+        # PnL Calculation
+        if side == "LONG":
+            pnl = (exit_price - entry_price) * position_size
+        else:
+            pnl = (entry_price - exit_price) * position_size
+            
+        balance += pnl
+        trades.append({
+            "time": df.iloc[i+2]['ts'], "side": side, "outcome": outcome,
+            "entry": entry_price, "exit": exit_price, "pnl": pnl, "balance": balance
+        })
+        i = j
+
+    # --- RESULTS ---
     if not trades:
         print(f"\n[{inst}] No valid setups found.")
         return
@@ -140,19 +148,13 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} PROVEN BASELINE BACKTEST =====")
-    print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
-    print(f"Total Trades: {len(trades)}")
-    print(f"Wins: {wins} | Losses: {losses}")
+    print(f"\n===== {inst} DUAL-SIDED SMC BACKTEST =====")
+    print(f"Total Trades: {len(trades)} | Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print("-------------------------------------------------------------")
-    print("Last 3 Trades:")
-    for t in trades[-3:]:
-        print(f"  {t['time']} | {t['outcome']} | Entry: {t['entry']:.2f} | Exit: {t['exit']:.2f} | PnL: ${t['pnl']:,.2f}")
-    print("=============================================================")
+    print("=========================================================")
 
 if __name__ == "__main__":
     run_backtest("BTC-USDT-SWAP")
