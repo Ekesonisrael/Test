@@ -1,7 +1,5 @@
 name: backtest
 
-# Each push to main that changes backtest.py = one trial.
-# Manual dispatch is a re-run; note the trial rule at the top of backtest.py.
 on:
   workflow_dispatch:
   push:
@@ -13,7 +11,7 @@ on:
 
 concurrency:
   group: backtest-${{ github.ref }}
-  cancel-in-progress: false   # never cancel a running trial; queue instead
+  cancel-in-progress: false
 
 permissions:
   contents: read
