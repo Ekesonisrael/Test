@@ -1,12 +1,12 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 import requests
 import pandas as pd
 import numpy as np
 
 # ==========================================
-# 1. DATA ENGINE (Free OKX API - 1000 Candles)
+# 1. DATA ENGINE (Expanded to 3000 Candles)
 # ==========================================
-def fetch_okx_data(inst, limit=1000):
+def fetch_okx_data(inst, limit=3000):
     print(f"Fetching {limit} candles for {inst}...")
     url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit=100"
     all_data = []
@@ -18,6 +18,7 @@ def fetch_okx_data(inst, limit=1000):
         if r["code"] != "0" or not r["data"]: break
         all_data.extend(r["data"])
         after = r["data"][-1][0]
+        if len(r["data"]) < 100: break
         
     df = pd.DataFrame(all_data, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
     df = df.iloc[::-1].reset_index(drop=True)
@@ -34,7 +35,7 @@ def fetch_okx_data(inst, limit=1000):
     return df
 
 # ==========================================
-# 2. OPTIMIZED SMC STRATEGY (20-CANDLE LOOKBACK)
+# 2. BALANCED SMC STRATEGY (15-CANDLE LOOKBACK)
 # ==========================================
 def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     df = fetch_okx_data(inst)
@@ -43,7 +44,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
     balance = initial_balance
     trades = []
     
-    i = 60 # Start after 50 EMA has warmed up (and safely past 20 candles)
+    i = 60
     while i < len(df) - 55:
         sweep_candle = df.iloc[i]
         confirm_candle = df.iloc[i+1]
@@ -53,8 +54,8 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
             i += 1
             continue
 
-        # WIDENED LOOKBACK: Find lowest low of prior 20 candles for broader liquidity pool
-        prior_low = df['l'].iloc[i-20:i].min()
+        # BALANCED LOOKBACK: Find lowest low of prior 15 candles
+        prior_low = df['l'].iloc[i-15:i].min()
         
         # 1. LIQUIDITY SWEEP
         is_sweep = sweep_candle['l'] < prior_low and sweep_candle['c'] > prior_low
@@ -67,7 +68,7 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
                 break
             entry_price = df.iloc[i+2]['o']
             
-            # Stop Loss safely below the expanded sweep structure
+            # Stop Loss safely below the sweep wick
             sl = sweep_candle['l'] * 0.997
             
             # Take Profit (1:2.5 R:R)
@@ -132,14 +133,14 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
     # --- PRINT RESULTS ---
     if not trades:
-        print(f"\n[{inst}] No valid 20-candle lookback SMC setups found.")
+        print(f"\n[{inst}] No valid setups found.")
         return
 
     wins = sum(1 for t in trades if t['outcome'] == 'WIN')
     losses = sum(1 for t in trades if t['outcome'] == 'LOSS')
     win_rate = (wins / len(trades)) * 100
     
-    print(f"\n===== {inst} 20-CANDLE LOOKBACK SMC BACKTEST =====")
+    print(f"\n===== {inst} 15-CANDLE LOOKBACK (3000 CANDLES) =====")
     print(f"Period: {df['ts'].iloc[60].date()} to {df['ts'].iloc[-1].date()}")
     print(f"Total Trades: {len(trades)}")
     print(f"Wins: {wins} | Losses: {losses}")
@@ -156,4 +157,3 @@ def run_backtest(inst, initial_balance=10000.0, risk_pct=0.01, leverage=3):
 if __name__ == "__main__":
     run_backtest("BTC-USDT-SWAP")
     run_backtest("SOL-USDT-SWAP")
-    
