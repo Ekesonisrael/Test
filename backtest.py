@@ -15,7 +15,8 @@ CHANGELOG (pre-first-real-run, from code review — not counted as a trial):
     null is. A buy-and-hold null would have near-zero cost but leverage
     would drift, so it wouldn't be a "matched" null. Chosen deliberately.
   - Empty bear-slice in funding-drag report now prints nan%, not crash.
-  - Added sanity checks to funding fetch: column count >= 3, |rate| < 1%.
+  - Added sanity checks to funding fetch: column count >= 3, |rate| < 5%.
+  - Filter out future-dated candles from OKX API.
   - NOTE ON VOL TARGET: TARGET_VOL is PER COIN, not portfolio. With BTC/SOL
     correlation ~0.75, realised PORTFOLIO vol runs ~14% vs 15% per-coin.
     Reported explicitly in output. Frozen as per-coin; do not change post-run.
@@ -72,6 +73,8 @@ def fetch_okx(inst):
     df.index = pd.to_datetime(df.ts.astype("int64"), unit="ms").dt.normalize()
     df = df.sort_index()[["o", "c"]].astype(float)
     df.columns = ["open", "close"]
+    # Filter out any future-dated candles
+    df = df[df.index <= pd.Timestamp.utcnow().normalize()]
     return df[~df.index.duplicated()]
 
 
@@ -90,10 +93,12 @@ def fetch_funding(sym, start, end):
         t = pd.to_numeric(df.iloc[:, 0], errors="coerce")
         f = pd.to_numeric(df.iloc[:, 2], errors="coerce")
         d = pd.DataFrame({"t": t, "f": f}).dropna()
-        bad = d[d.f.abs() > 0.01]
+        
+        # Relaxed bound from 1% to 5% to accommodate extreme events (e.g. Nov 2022)
+        bad = d[d.f.abs() > 0.05]
         if len(bad):
-            raise RuntimeError(f"{sym} {m}: {len(bad)} rates outside (-1%, +1%) — "
-                               f"column layout may have changed")
+            raise RuntimeError(f"{sym} {m}: {len(bad)} rates outside (-5%, +5%) — "
+                               f"column layout may have changed. Sample:\n{bad.head()}")
         out.append(d)
     if not out:
         raise RuntimeError(f"no funding data for {sym}")
