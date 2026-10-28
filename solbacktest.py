@@ -5,7 +5,8 @@ import numpy as np
 
 def fetch_data(inst, limit=10000):
     print(f"Fetching {limit} candles for {inst}...")
-    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit=100"
+    # CHANGED BAR TO 1H
+    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=1H&limit=100"
     all_data = []
     after = ""
     
@@ -32,7 +33,7 @@ def fetch_data(inst, limit=10000):
     
     return df
 
-def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
+def run_1h_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     sol_df = fetch_data("SOL-USDT-SWAP")
     btc_df = fetch_data("BTC-USDT-SWAP")
     
@@ -45,12 +46,12 @@ def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     trades = []
     macro_blocked = 0
     
-    rr_target = 2.5       # FIXED: Back to our proven winning math
-    lookback = 15
-    slippage = 0.0005     # 0.05% slippage penalty on market fills
+    rr_target = 2.5       
+    lookback = 20        # Deeper lookback for 1H chart
+    slippage = 0.0005     
     
     i = lookback + 15
-    while i < len(sol_df) - 100:
+    while i < len(sol_df) - 100: # 100 hour look-ahead (~4 days)
         sweep = sol_df.iloc[i]
         confirm = sol_df.iloc[i+1]
         entry_candle = sol_df.iloc[i+2]
@@ -72,22 +73,22 @@ def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
         
         side = None
         
-        # --- LONG SETUP (Market Execution + Slippage) ---
+        # --- LONG SETUP ---
         if is_bullish:
             if sweep['l'] < prior_low and sweep['c'] > prior_low:
                 if confirm['c'] > confirm['o'] and confirm['c'] > sweep['o']:
                     if not btc_is_bullish:
-                        macro_blocked += 1 # Macro filter saved us
+                        macro_blocked += 1 
                     else:
                         side = "LONG"
                         entry_price = entry_candle['o'] * (1.0 + slippage)
                         
-        # --- SHORT SETUP (Market Execution + Slippage) ---
+        # --- SHORT SETUP ---
         elif is_bearish:
             if sweep['h'] > prior_high and sweep['c'] < prior_high:
                 if confirm['c'] < confirm['o'] and confirm['c'] < sweep['o']:
                     if not btc_is_bearish:
-                        macro_blocked += 1 # Macro filter saved us
+                        macro_blocked += 1 
                     else:
                         side = "SHORT"
                         entry_price = entry_candle['o'] * (1.0 - slippage)
@@ -111,7 +112,7 @@ def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
 
                 outcome = "OPEN"
                 exit_price = None
-                max_forward = min(i + 50, len(sol_df) - 1)
+                max_forward = min(i + 100, len(sol_df) - 1) # 100 hours timeout
                 
                 for j in range(i+3, max_forward):
                     future = sol_df.iloc[j]
@@ -150,14 +151,14 @@ def run_clean_sol_backtest(initial_balance=10000.0, risk_pct=0.01, leverage=3):
     timeouts = sum(1 for t in trades if t['outcome'] == 'TIMEOUT')
     win_rate = (wins / max(1, wins+losses)) * 100
     
-    print(f"\n===== FINAL SOL BACKTEST (Market Execution + BTC Filter) =====")
+    print(f"\n===== 1H SOL BACKTEST (1 Year+ of Data) =====")
     print(f"Total Trades Executed: {len(trades)} | Wins: {wins} | Losses: {losses} | Timeouts: {timeouts}")
     print(f"Win Rate (excl Timeouts): {win_rate:.1f}%")
     print(f"Macro Filter Blocked Setups: {macro_blocked}")
     print(f"Starting Balance: ${initial_balance:,.2f}")
     print(f"Final Balance:    ${balance:,.2f}")
     print(f"Total Return:     {((balance/initial_balance)-1)*100:+.2f}%")
-    print("=============================================================")
+    print("============================================")
 
 if __name__ == "__main__":
-    run_clean_sol_backtest()
+    run_1h_sol_backtest()
