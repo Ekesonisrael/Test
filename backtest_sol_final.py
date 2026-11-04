@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 
 # ==========================================
-# CONFIGURATION (BTC ONLY)
+# CONFIGURATION (BTC, ETH, SOL)
 # ==========================================
-SYMBOL = "BTC/USDT:USDT"     # ✅ CHANGED TO BTC
+SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 TIMEFRAME = "4h"
-MONTHS_BACK = 48             # 4 Years 
+MONTHS_BACK = 5              # ✅ 5 Months of testing
 
 # Exits (R-based)
 ATR_MULTIPLIER = 2.0         
@@ -155,22 +155,29 @@ def backtest(df):
     return trades
 
 if __name__ == "__main__":
-    print("Starting BTC 4H Backtest...", flush=True)
-    raw = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
-    if raw.empty:
-        print("No data.")
-        exit()
-        
-    print(f"Data Loaded. Range: {raw['time'].iloc[0]} to {raw['time'].iloc[-1]}")
-    print(f"Total Bars: {len(raw)}")
+    print(f"Starting 3-Coin 4H Backtest ({MONTHS_BACK} Months)...", flush=True)
     
-    df = add_indicators(raw)
-    trades = backtest(df)
+    for sym in SYMBOLS:
+        print(f"\n{'='*50}")
+        print(f"  TESTING {sym}")
+        print(f"{'='*50}")
+        
+        raw = fetch_okx_data(sym, TIMEFRAME, MONTHS_BACK)
+        if raw.empty:
+            print("No data fetched.", flush=True)
+            continue
+            
+        print(f"Data Loaded. Range: {raw['time'].iloc[0]} to {raw['time'].iloc[-1]}", flush=True)
+        print(f"Total Bars: {len(raw)}", flush=True)
+        
+        df = add_indicators(raw)
+        trades = backtest(df)
 
-    n = len(trades)
-    if n == 0:
-        print("No trades found.")
-    else:
+        n = len(trades)
+        if n == 0:
+            print("No trades found.", flush=True)
+            continue
+            
         r = np.array([t["r"] for t in trades])
         wins, losses = r[r > 0], r[r <= 0]
         cum = np.cumsum(r)
@@ -184,11 +191,11 @@ if __name__ == "__main__":
         gross_loss = abs(losses.sum())
         pf = wins.sum() / gross_loss if gross_loss > 0 else float("inf")
 
-        print("\n" + "="*50)
-        print("  BTC 4H MONSTER BACKTEST RESULTS (4 YEARS)")
-        print("="*50)
-        print(f"  Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%")
-        print(f"  Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}")
-        print(f"  Avg win: {wins.mean() if len(wins) else 0:.2f}R | Avg loss: {losses.mean() if len(losses) else 0:.2f}R")
-        print(f"  Max DD: {max_dd:.2f}R | Longest losing streak: {longest}")
-        print("="*50)
+        print(f"\nResults for {sym}:", flush=True)
+        print(f"Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%", flush=True)
+        print(f"Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}", flush=True)
+        print(f"Avg win: {wins.mean() if len(wins) else 0:.2f}R | Avg loss: {losses.mean() if len(losses) else 0:.2f}R", flush=True)
+        print(f"Max DD: {max_dd:.2f}R | Longest losing streak: {longest}", flush=True)
+        
+        if n < 30:
+            print(f"!! WARNING: Only {n} trades. Statistically meaningless.", flush=True)
