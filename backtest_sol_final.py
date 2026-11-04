@@ -1,35 +1,23 @@
-import time
 import ccxt
-import numpy as np
 import pandas as pd
+import numpy as np
+import time
 
 # ==========================================
-# CONFIGURATION (BTC, ETH, SOL)
+# CONFIGURATION
 # ==========================================
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
-TIMEFRAME = "4h"
-MONTHS_BACK = 48             # ✅ CHANGED TO 4 YEARS
+SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
+TIMEFRAME = "15m"
+MONTHS_BACK = 3              
+RISK_REWARD = 2.0
+ATR_MULTIPLIER = 2.5         
+VOLUME_MULTIPLIER = 1.5
+LOOKBACK = 20
+FEE_RATE = 0.0010            
+USE_WICK_STOP = True         
+WICK_BUFFER_ATR = 0.1        
 
-# Exits (R-based)
-ATR_MULTIPLIER = 2.0         
-TRAIL_ATR_MULTIPLIER = 3.0   
-
-# Costs
-FEE_PER_SIDE = 0.0005        
-SLIPPAGE_PER_SIDE = 0.0004   
-FUNDING_PER_8H = 0.0001      
-
-# Indicators
-ADX_PERIOD = 14
-ADX_THRESHOLD = 20
-ATR_PERIOD = 14
-EMA_PERIOD = 200
-DONCHIAN_PERIOD = 20
-VOL_MA_PERIOD = 20
-VOL_MULT = 1.5
-WARMUP_BARS = 300            
-
-exchange = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 def fetch_okx_data(symbol, timeframe, months):
     print(f"Fetching {months}m of {timeframe} for {symbol}...", flush=True)
@@ -46,7 +34,6 @@ def fetch_okx_data(symbol, timeframe, months):
             fails = 0
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"Fetch error: {e}", flush=True)
             fails += 1
             if fails > 5: break
             time.sleep(2)
@@ -55,147 +42,151 @@ def fetch_okx_data(symbol, timeframe, months):
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
-def add_indicators(df):
+def run_backtest(df, max_trades_per_day, max_trades_per_week, label):
     df = df.copy()
-    prev_close = df["close"].shift()
-    df["tr"] = pd.concat(
-        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
+    
+    # 1. RESAMPLE TO 4H
+    df.set_index('time', inplace=True)
+    df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    
+    # Calculate Indicators on closed 4H candles
+    df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
+    df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+    df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
+    
+    # ✅ CRITICAL FIX: Shift trend by 1 so we only use CLOSED 4H candles
+    df_4h['trend'] = df_4h['trend'].shift(1)
+    
+    df.reset_index(inplace=True)
+    
+    # 2. CALCULATE 15M INDICATORS
+    df['high_low'] = df['high'] - df['low']
+    df['high_close'] = (df['high'] - df['close'].shift()).abs()
+    df['low_close'] = (df['low'] - df['close'].shift()).abs()
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    df['vol_ma'] = df['volume'].rolling(window=20).mean()
+    df['recent_low'] = df['low'].rolling(window=LOOKBACK).min().shift(1)
+    df['recent_high'] = df['high'].rolling(window=LOOKBACK).max().shift(1)
 
-    up = df["high"].diff()
-    down = -df["low"].diff()
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    a = 1 / ADX_PERIOD
-    tr_s = df["tr"].ewm(alpha=a, adjust=False).mean()
-    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
-    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    df["adx"] = dx.ewm(alpha=a, adjust=False).mean()
-
-    df["atr"] = df["tr"].ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()  
-    df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-    df["vol_ma"] = df["volume"].rolling(VOL_MA_PERIOD).mean()
-    df["don_high"] = df["high"].rolling(DONCHIAN_PERIOD).max().shift(1)
-    df["don_low"] = df["low"].rolling(DONCHIAN_PERIOD).min().shift(1)
-    return df
-
-def backtest(df):
-    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
-    atr, adx, ema = df["atr"].values, df["adx"].values, df["ema200"].values
-    vol, vma = df["volume"].values, df["vol_ma"].values
-    dhi, dlo = df["don_high"].values, df["don_low"].values
-
+    # ✅ The floored timestamp now perfectly matches the shifted 4H trend
+    df['4h_time'] = df['time'].dt.floor('4h')
+    df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
+    
     trades = []
-    tr = None
+    active_trades = []
+    attempted_sweeps = set()
+    
+    daily_trade_counts = {}
+    weekly_trade_counts = {}
+    
+    i = 50 
 
-    def close_trade(t, i, raw_exit, reason):
-        if t["side"] == "LONG":
-            px = raw_exit * (1 - SLIPPAGE_PER_SIDE)
-            pnl = (px - t["entry"]) / t["entry"]
-        else:
-            px = raw_exit * (1 + SLIPPAGE_PER_SIDE)
-            pnl = (t["entry"] - px) / t["entry"]
+    while i < len(df) - 5:
+        candle = df.iloc[i]
         
-        held_hours = (i - t["entry_idx"] + 1) * 4 
-        funding = FUNDING_PER_8H * held_hours / 8
-        net_r = (pnl - 2 * FEE_PER_SIDE - funding) / t["risk_pct"]
-        trades.append({"side": t["side"], "r": net_r, "reason": reason})
+        # MANAGE EXITS
+        for trade in active_trades[:]: 
+            exit_triggered = False
+            result = None
+            
+            if trade['side'] == 'LONG':
+                if candle['low'] <= trade['sl']: result, exit_triggered = 'LOSS', True
+                elif candle['high'] >= trade['tp']: result, exit_triggered = 'WIN', True
+            elif trade['side'] == 'SHORT':
+                if candle['high'] >= trade['sl']: result, exit_triggered = 'LOSS', True
+                elif candle['low'] <= trade['tp']: result, exit_triggered = 'WIN', True
+                    
+            if exit_triggered:
+                net_r = (RISK_REWARD if result == 'WIN' else -1.0) - trade['cost_r']
+                trades.append({'result': result, 'r': net_r})
+                active_trades.remove(trade)
 
-    def manage(t, i):
-        if t["side"] == "LONG":
-            if l[i] <= t["sl"]:
-                close_trade(t, i, min(o[i], t["sl"]), "STOP") 
-                return True
-            t["peak"] = max(t["peak"], h[i])
-            t["sl"] = max(t["sl"], t["peak"] - TRAIL_ATR_MULTIPLIER * atr[i])
-        else:
-            if h[i] >= t["sl"]:
-                close_trade(t, i, max(o[i], t["sl"]), "STOP")
-                return True
-            t["peak"] = min(t["peak"], l[i])
-            t["sl"] = min(t["sl"], t["peak"] + TRAIL_ATR_MULTIPLIER * atr[i])
-        return False
+        # CHECK SIGNALS
+        sweep_row = df.iloc[i-2]
+        conf_row = df.iloc[i-1]
+        sweep_key = str(sweep_row['time'])
+        
+        if sweep_key not in attempted_sweeps:
+            vol_ok = sweep_row['volume'] > (sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
+            swept_low = (sweep_row['low'] < sweep_row['recent_low']) and (sweep_row['close'] > sweep_row['recent_low']) and vol_ok
+            swept_high = (sweep_row['high'] > sweep_row['recent_high']) and (sweep_row['close'] < sweep_row['recent_high']) and vol_ok
 
-    for i in range(max(WARMUP_BARS, 1), len(df)):
-        had_trade = tr is not None
-        if had_trade and manage(tr, i):
-            tr = None
+            conf_long = conf_row['close'] > conf_row['open']
+            conf_short = conf_row['close'] < conf_row['open']
 
-        if had_trade:
-            continue
+            side = None
+            if sweep_row['trend'] == 1 and swept_low and conf_long: side = 'LONG'
+            elif sweep_row['trend'] == -1 and swept_high and conf_short: side = 'SHORT'
 
-        s = i - 1  
-        vals = (atr[s], adx[s], ema[s], vma[s], dhi[s], dlo[s])
-        if any(np.isnan(v) for v in vals):
-            continue
+            if side:
+                # Check Trade Limits
+                day_str = str(sweep_row['time'].date())
+                week_str = f"{sweep_row['time'].year}-{sweep_row['time'].isocalendar()[1]}"
+                
+                d_count = daily_trade_counts.get(day_str, 0)
+                w_count = weekly_trade_counts.get(week_str, 0)
+                
+                can_trade = True
+                if max_trades_per_day and d_count >= max_trades_per_day: can_trade = False
+                if max_trades_per_week and w_count >= max_trades_per_week: can_trade = False
+                
+                if can_trade:
+                    attempted_sweeps.add(sweep_key)
+                    daily_trade_counts[day_str] = d_count + 1
+                    weekly_trade_counts[week_str] = w_count + 1
+                    
+                    entry = candle['open']
+                    atr = sweep_row['atr']
+                    
+                    if side == 'LONG':
+                        sl = entry - (atr * ATR_MULTIPLIER)
+                        if USE_WICK_STOP: sl = min(sl, sweep_row['low'] - (atr * WICK_BUFFER_ATR))
+                        risk = entry - sl
+                        tp = entry + (risk * RISK_REWARD)
+                    else:
+                        sl = entry + (atr * ATR_MULTIPLIER)
+                        if USE_WICK_STOP: sl = max(sl, sweep_row['high'] + (atr * WICK_BUFFER_ATR))
+                        risk = sl - entry
+                        tp = entry - (risk * RISK_REWARD)
+                    
+                    cost_r = FEE_RATE / (risk / entry) 
+                    active_trades.append({'side': side, 'entry': entry, 'sl': sl, 'tp': tp, 'cost_r': cost_r})
+                
+        i += 1
 
-        trending = adx[s] > ADX_THRESHOLD
-        vol_ok = vol[s] > vma[s] * VOL_MULT
-
-        if trending and vol_ok and c[s] > ema[s] and c[s] > dhi[s]:
-            entry = o[i] * (1 + SLIPPAGE_PER_SIDE)
-            sl = entry - ATR_MULTIPLIER * atr[s]
-            tr = {"side": "LONG", "entry": entry, "sl": sl, "peak": entry,
-                  "risk_pct": (entry - sl) / entry, "entry_idx": i}
-        elif trending and vol_ok and c[s] < ema[s] and c[s] < dlo[s]:
-            entry = o[i] * (1 - SLIPPAGE_PER_SIDE)
-            sl = entry + ATR_MULTIPLIER * atr[s]
-            tr = {"side": "SHORT", "entry": entry, "sl": sl, "peak": entry,
-                  "risk_pct": (sl - entry) / entry, "entry_idx": i}
-
-        if tr is not None and manage(tr, i):
-            tr = None
-
-    if tr is not None:
-        close_trade(tr, len(df) - 1, c[-1], "EOD")
-
-    return trades
+    # CALCULATE METRICS
+    total = len(trades)
+    if total == 0: return f"{label}: No trades found."
+        
+    wins = sum(1 for t in trades if t['result'] == 'WIN')
+    total_r = sum(t['r'] for t in trades)
+    
+    win_rate = (wins/total)*100 if total > 0 else 0
+    expectancy = total_r / total if total > 0 else 0
+    
+    return f"{label}: {total} trades | Win Rate: {win_rate:.1f}% | Total R: {total_r:+.2f}R | Expectancy: {expectancy:+.3f}R"
 
 if __name__ == "__main__":
-    print(f"Starting 3-Coin 4H Backtest ({MONTHS_BACK} Months)...", flush=True)
+    print("Starting Frequency Analysis Backtest (Lookahead Fixed)...", flush=True)
+    
+    configs = [
+        (None, None, "Unlimited"),
+        (2, None, "Max 2/Day"),
+        (1, None, "Max 1/Day"),
+        (None, 5, "Max 5/Week"),
+        (None, 3, "Max 3/Week"),
+        (None, 1, "Max 1/Week")
+    ]
     
     for sym in SYMBOLS:
-        print(f"\n{'='*50}", flush=True)
-        print(f"  TESTING {sym}", flush=True)
-        print(f"{'='*50}", flush=True)
+        print(f"\n{'='*60}", flush=True)
+        print(f"  RESULTS FOR {sym}", flush=True)
+        print(f"{'='*60}", flush=True)
         
         raw = fetch_okx_data(sym, TIMEFRAME, MONTHS_BACK)
-        if raw.empty:
-            print("No data fetched.", flush=True)
-            continue
-            
-        print(f"Data Loaded. Range: {raw['time'].iloc[0]} to {raw['time'].iloc[-1]}", flush=True)
-        print(f"Total Bars: {len(raw)}", flush=True)
+        if raw.empty: continue
         
-        df = add_indicators(raw)
-        trades = backtest(df)
-
-        n = len(trades)
-        if n == 0:
-            print("No trades found.", flush=True)
-            continue
-            
-        r = np.array([t["r"] for t in trades])
-        wins, losses = r[r > 0], r[r <= 0]
-        cum = np.cumsum(r)
-        max_dd = float(np.min(cum - np.maximum.accumulate(cum)))
-
-        streak = longest = 0
-        for x in r:
-            streak = streak + 1 if x <= 0 else 0
-            longest = max(longest, streak)
-
-        gross_loss = abs(losses.sum())
-        pf = wins.sum() / gross_loss if gross_loss > 0 else float("inf")
-
-        print(f"\nResults for {sym}:", flush=True)
-        print(f"Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%", flush=True)
-        print(f"Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}", flush=True)
-        print(f"Avg win: {wins.mean() if len(wins) else 0:.2f}R | Avg loss: {losses.mean() if len(losses) else 0:.2f}R", flush=True)
-        print(f"Max DD: {max_dd:.2f}R | Longest losing streak: {longest}", flush=True)
-        
-        if n < 30:
-            print(f"!! WARNING: Only {n} trades. Statistically meaningless.", flush=True)
+        for max_day, max_week, label in configs:
+            res = run_backtest(raw, max_day, max_week, label)
+            print(res, flush=True)
