@@ -1,38 +1,38 @@
-import ccxt
-import pandas as pd
-import numpy as np
 import time
-from datetime import datetime
+import ccxt
+import numpy as np
+import pandas as pd
 
 # ==========================================
-# PRE-REGISTERED PASS CRITERIA (Don't change these after seeing results)
+# CONFIGURATION (SOL ONLY)
 # ==========================================
-MIN_SHARPE = 1.0
-MIN_PROFIT_FACTOR = 1.2
-MIN_EXPECTANCY = 0.0  # Positive return
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-# A wider basket, acknowledging survivorship bias (we can only test what OKX still lists)
-SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "DOGE/USDT:USDT",
-    "DOT/USDT:USDT", "LINK/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", 
-    "UNI/USDT:USDT", "ATOM/USDT:USDT", "ETC/USDT:USDT", "FIL/USDT:USDT",
-    "APT/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT"
-]
-
+SYMBOL = "SOL/USDT:USDT"
 TIMEFRAME = "4h"
-MONTHS_BACK = 60             # 5 years (Covers 2022 Bear Market)
-FEE_PER_SIDE = 0.0005        # 0.05%
-SLIPPAGE_PER_SIDE = 0.0004   # 0.04%
-FUNDING_PER_8H = 0.0001      # 0.01% per 8 hours
-INITIAL_CAPITAL = 10000      
+MONTHS_BACK = 48             # 4 Years (To get enough trades)
 
-exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+# Exits (R-based)
+ATR_MULTIPLIER = 2.0         
+TRAIL_ATR_MULTIPLIER = 3.0   
+
+# Costs
+FEE_PER_SIDE = 0.0005        
+SLIPPAGE_PER_SIDE = 0.0004   
+FUNDING_PER_8H = 0.0001      
+
+# Indicators
+ADX_PERIOD = 14
+ADX_THRESHOLD = 20
+ATR_PERIOD = 14
+EMA_PERIOD = 200
+DONCHIAN_PERIOD = 20
+VOL_MA_PERIOD = 20
+VOL_MULT = 1.5
+WARMUP_BARS = 300            
+
+exchange = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 
 def fetch_okx_data(symbol, timeframe, months):
+    print(f"Fetching {months}m of {timeframe} for {symbol}...", flush=True)
     end_time = exchange.milliseconds()
     since = end_time - int(months * 30 * 24 * 60 * 60 * 1000)
     rows, fails = [], 0
@@ -46,197 +46,149 @@ def fetch_okx_data(symbol, timeframe, months):
             fails = 0
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
+            print(f"Fetch error: {e}", flush=True)
             fails += 1
             if fails > 5: break
             time.sleep(2)
 
-    if not rows: return pd.DataFrame()
     df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
-def run_simulation(df_open, df_close, lookback_bars, top_n):
-    # Calculate returns bar-by-bar
-    df_ret = df_open.pct_change()
-    
-    # Calculate historical volatility (for inverse weighting)
-    df_vol = df_ret.rolling(window=lookback_bars).std()
-    
-    # Rebalance every 7 days (42 bars)
-    rebalance_bars = 7 * 6 
-    
-    equity = INITIAL_CAPITAL
-    equity_curve = []
-    
-    # We start after the lookback period
-    for i in range(lookback_bars, len(df_close) - rebalance_bars, rebalance_bars):
+def add_indicators(df):
+    df = df.copy()
+    prev_close = df["close"].shift()
+    df["tr"] = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    up = df["high"].diff()
+    down = -df["low"].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    a = 1 / ADX_PERIOD
+    tr_s = df["tr"].ewm(alpha=a, adjust=False).mean()
+    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
+    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    df["adx"] = dx.ewm(alpha=a, adjust=False).mean()
+
+    df["atr"] = df["tr"].ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()  
+    df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["vol_ma"] = df["volume"].rolling(VOL_MA_PERIOD).mean()
+    df["don_high"] = df["high"].rolling(DONCHIAN_PERIOD).max().shift(1)
+    df["don_low"] = df["low"].rolling(DONCHIAN_PERIOD).min().shift(1)
+    return df
+
+def backtest(df):
+    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
+    atr, adx, ema = df["atr"].values, df["adx"].values, df["ema200"].values
+    vol, vma = df["volume"].values, df["vol_ma"].values
+    dhi, dlo = df["don_high"].values, df["don_low"].values
+
+    trades = []
+    tr = None
+
+    def close_trade(t, i, raw_exit, reason):
+        if t["side"] == "LONG":
+            px = raw_exit * (1 - SLIPPAGE_PER_SIDE)
+            pnl = (px - t["entry"]) / t["entry"]
+        else:
+            px = raw_exit * (1 + SLIPPAGE_PER_SIDE)
+            pnl = (t["entry"] - px) / t["entry"]
         
-        # Get current momentum scores and vol
-        # Drop NaNs per-row to avoid dropping the whole dataset
-        mom_scores = df_close.pct_change(lookback_bars).iloc[i].dropna()
-        vols = df_vol.iloc[i].dropna()
-        
-        # Only trade coins that have enough data
-        valid_coins = mom_scores.index.intersection(vols.index)
-        if len(valid_coins) < top_n * 2:
+        held_hours = (i - t["entry_idx"] + 1) * 4 
+        funding = FUNDING_PER_8H * held_hours / 8
+        net_r = (pnl - 2 * FEE_PER_SIDE - funding) / t["risk_pct"]
+        trades.append({"side": t["side"], "r": net_r, "reason": reason})
+
+    def manage(t, i):
+        if t["side"] == "LONG":
+            if l[i] <= t["sl"]:
+                close_trade(t, i, min(o[i], t["sl"]), "STOP") 
+                return True
+            t["peak"] = max(t["peak"], h[i])
+            t["sl"] = max(t["sl"], t["peak"] - TRAIL_ATR_MULTIPLIER * atr[i])
+        else:
+            if h[i] >= t["sl"]:
+                close_trade(t, i, max(o[i], t["sl"]), "STOP")
+                return True
+            t["peak"] = min(t["peak"], l[i])
+            t["sl"] = min(t["sl"], t["peak"] + TRAIL_ATR_MULTIPLIER * atr[i])
+        return False
+
+    for i in range(max(WARMUP_BARS, 1), len(df)):
+        had_trade = tr is not None
+        if had_trade and manage(tr, i):
+            tr = None
+
+        if had_trade:
             continue
-            
-        mom_scores = mom_scores[valid_coins]
-        vols = vols[valid_coins]
-        
-        longs = mom_scores.nlargest(top_n).index.tolist()
-        shorts = mom_scores.nsmallest(top_n).index.tolist()
-        
-        # Inverse Volatility Weighting
-        # Weight = (1/Vol) / sum(1/Vol)
-        inv_vols = 1 / vols
-        weights = inv_vols / inv_vols.sum()
-        
-        long_weights = weights[longs]
-        short_weights = weights[shorts]
-        
-        # Normalize weights so total gross exposure is 100% (50% long, 50% short)
-        long_weights = long_weights / long_weights.sum() * 0.5
-        short_weights = short_weights / short_weights.sum() * 0.5
-        
-        # Track daily equity within the holding period
-        for j in range(i + 1, i + rebalance_bars + 1):
-            if j >= len(df_close): break
-            
-            # Calculate bar return (using next open to next open to avoid look-ahead)
-            bar_ret = df_ret.iloc[j]
-            
-            # Long PnL
-            long_pnl = sum(bar_ret[sym] * long_weights[sym] for sym in longs)
-            
-            # Short PnL
-            short_pnl = sum(-bar_ret[sym] * short_weights[sym] for sym in shorts)
-            
-            # Funding costs (4h bar = 0.5 * 8h funding)
-            # Longs pay funding if positive, shorts receive. We assume positive funding environment for alts.
-            funding_cost = FUNDING_PER_8H * 0.5 * 0.5 # 50% exposure, 0.5 of 8h
-            net_pnl = long_pnl + short_pnl - funding_cost
-            
-            # Apply entry costs (spread over the 42 bars)
-            trade_cost = (FEE_PER_SIDE * 2 + SLIPPAGE_PER_SIDE * 2) / rebalance_bars
-            
-            equity = equity * (1 + net_pnl - trade_cost)
-            equity_curve.append({'time': df_close.index[j], 'equity': equity})
 
-    return pd.DataFrame(equity_curve).set_index('time')
+        s = i - 1  
+        vals = (atr[s], adx[s], ema[s], vma[s], dhi[s], dlo[s])
+        if any(np.isnan(v) for v in vals):
+            continue
 
-def calculate_metrics(eq_df):
-    if eq_df.empty: return None
-    
-    # Daily resampling for Sharpe
-    daily_eq = eq_df['equity'].resample('D').last().dropna()
-    daily_ret = daily_eq.pct_change().dropna()
-    
-    # Sharpe (Annualized)
-    sharpe = (daily_ret.mean() / daily_ret.std()) * np.sqrt(365) if daily_ret.std() > 0 else 0
-    
-    # Max Drawdown
-    running_max = np.maximum.accumulate(daily_eq)
-    drawdowns = (daily_eq - running_max) / running_max
-    max_dd = drawdowns.min() * 100
-    
-    # Profit Factor & Expectancy (based on weekly returns)
-    weekly_eq = eq_df['equity'].resample('W').last().dropna()
-    weekly_ret = weekly_eq.pct_change().dropna()
-    
-    wins = weekly_ret[weekly_ret > 0]
-    losses = weekly_ret[weekly_ret <= 0]
-    
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-    expectancy = weekly_ret.mean()
-    
-    total_return = (daily_eq.iloc[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-    
-    return {
-        'total_ret': total_return,
-        'sharpe': sharpe,
-        'max_dd': max_dd,
-        'pf': pf,
-        'expectancy': expectancy,
-        'trades': len(weekly_ret)
-    }
+        trending = adx[s] > ADX_THRESHOLD
+        vol_ok = vol[s] > vma[s] * VOL_MULT
 
-def run_backtest():
-    print("Fetching data (this will take a few minutes)...", flush=True)
-    data_open = {}
-    data_close = {}
-    
-    for sym in SYMBOLS:
-        df = fetch_okx_data(sym, TIMEFRAME, MONTHS_BACK)
-        if not df.empty:
-            df.set_index('time', inplace=True)
-            data_open[sym] = df['open']
-            data_close[sym] = df['close']
-    
-    if not data_open:
-        print("No data fetched.")
-        return
+        if trending and vol_ok and c[s] > ema[s] and c[s] > dhi[s]:
+            entry = o[i] * (1 + SLIPPAGE_PER_SIDE)
+            sl = entry - ATR_MULTIPLIER * atr[s]
+            tr = {"side": "LONG", "entry": entry, "sl": sl, "peak": entry,
+                  "risk_pct": (entry - sl) / entry, "entry_idx": i}
+        elif trending and vol_ok and c[s] < ema[s] and c[s] < dlo[s]:
+            entry = o[i] * (1 - SLIPPAGE_PER_SIDE)
+            sl = entry + ATR_MULTIPLIER * atr[s]
+            tr = {"side": "SHORT", "entry": entry, "sl": sl, "peak": entry,
+                  "risk_pct": (sl - entry) / entry, "entry_idx": i}
 
-    df_open = pd.DataFrame(data_open)
-    df_close = pd.DataFrame(data_close)
-    
-    # Check date range
-    print(f"\nData Loaded. Range: {df_close.index[0]} to {df_close.index[-1]}", flush=True)
-    print(f"Total 4H Bars: {len(df_close)}", flush=True)
-    print(f"Total Coins: {len(df_close.columns)}", flush=True)
+        if tr is not None and manage(tr, i):
+            tr = None
 
-    # SPLIT DATA: Train (First 50%) / Test (Last 50%)
-    split_idx = len(df_close) // 2
-    split_date = df_close.index[split_idx]
-    
-    train_open, train_close = df_open.iloc[:split_idx], df_close.iloc[:split_idx]
-    test_open, test_close = df_open.iloc[split_idx:], df_close.iloc[split_idx:]
+    if tr is not None:
+        close_trade(tr, len(df) - 1, c[-1], "EOD")
 
-    print(f"\nTrain Period: {train_close.index[0]} to {train_close.index[-1]}")
-    print(f"Test Period:  {test_close.index[0]} to {test_close.index[-1]}")
-
-    # SENSITIVITY TABLE
-    lookbacks = [180, 360, 540] # 30 days, 60 days, 90 days
-    top_ns = [3, 5]
-
-    print("\n" + "="*80)
-    print("  PRE-REGISTERED CRITERIA:")
-    print(f"  Sharpe > {MIN_SHARPE} | PF > {MIN_PROFIT_FACTOR} | Expectancy > {MIN_EXPECTANCY*100}% (Weekly)")
-    print("="*80)
-
-    for lb in lookbacks:
-        for top_n in top_ns:
-            print(f"\n--- PARAMETERS: Lookback={lb} bars ({lb//6} days), Top N={top_n} ---")
-            
-            # Train
-            train_eq = run_simulation(train_open, train_close, lb, top_n)
-            train_metrics = calculate_metrics(train_eq)
-            
-            if not train_metrics:
-                print("  Train: No trades.")
-                continue
-                
-            print(f"  [TRAIN] Ret: {train_metrics['total_ret']:+.1f}% | Sharpe: {train_metrics['sharpe']:.2f} | DD: {train_metrics['max_dd']:.1f}% | PF: {train_metrics['pf']:.2f} | Exp: {train_metrics['expectancy']*100:+.2f}%")
-
-            # Test
-            test_eq = run_simulation(test_open, test_close, lb, top_n)
-            test_metrics = calculate_metrics(test_eq)
-            
-            if not test_metrics:
-                print("  Test: No trades.")
-                continue
-
-            # Check criteria
-            passed = (test_metrics['sharpe'] > MIN_SHARPE and 
-                      test_metrics['pf'] > MIN_PROFIT_FACTOR and 
-                      test_metrics['expectancy'] > MIN_EXPECTANCY)
-            
-            status = "✅ PASS" if passed else "❌ FAIL"
-            
-            print(f"  [TEST]  Ret: {test_metrics['total_ret']:+.1f}% | Sharpe: {test_metrics['sharpe']:.2f} | DD: {test_metrics['max_dd']:.1f}% | PF: {test_metrics['pf']:.2f} | Exp: {test_metrics['expectancy']*100:+.2f}%  -> {status}")
+    return trades
 
 if __name__ == "__main__":
-    print("Starting V2 Momentum Backtest...", flush=True)
-    run_backtest()
+    print("Starting SOL 4H Backtest...", flush=True)
+    raw = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
+    if raw.empty:
+        print("No data.")
+        exit()
+        
+    print(f"Data Loaded. Range: {raw['time'].iloc[0]} to {raw['time'].iloc[-1]}")
+    print(f"Total Bars: {len(raw)}")
+    
+    df = add_indicators(raw)
+    trades = backtest(df)
+
+    n = len(trades)
+    if n == 0:
+        print("No trades found.")
+    else:
+        r = np.array([t["r"] for t in trades])
+        wins, losses = r[r > 0], r[r <= 0]
+        cum = np.cumsum(r)
+        max_dd = float(np.min(cum - np.maximum.accumulate(cum)))
+
+        streak = longest = 0
+        for x in r:
+            streak = streak + 1 if x <= 0 else 0
+            longest = max(longest, streak)
+
+        gross_loss = abs(losses.sum())
+        pf = wins.sum() / gross_loss if gross_loss > 0 else float("inf")
+
+        print("\n" + "="*50)
+        print("  SOL 4H MONSTER BACKTEST RESULTS (4 YEARS)")
+        print("="*50)
+        print(f"  Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%")
+        print(f"  Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}")
+        print(f"  Avg win: {wins.mean() if len(wins) else 0:.2f}R | Avg loss: {losses.mean() if len(losses) else 0:.2f}R")
+        print(f"  Max DD: {max_dd:.2f}R | Longest losing streak: {longest}")
+        print("="*50)
