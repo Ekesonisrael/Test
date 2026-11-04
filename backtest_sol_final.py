@@ -6,9 +6,7 @@ import time
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
-MONTHS_BACK = 12             # 1 Year of data to get enough trades
-
+MONTHS_BACK = 12
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 def fetch_okx_data(symbol, timeframe, months):
@@ -35,21 +33,18 @@ def fetch_okx_data(symbol, timeframe, months):
     return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
 # ==========================================
-# BTC STRATEGY (15m SMC SWEEP)
+# BTC STRATEGY (15m SMC)
 # ==========================================
 def backtest_btc_smc(df_15m, df_4h):
     df_15m = df_15m.copy()
     df_4h = df_4h.copy()
     
-    # 4H Trend (Lookahead-free)
+    # 4H Trend (Shifted)
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-    
-    # ✅ CRITICAL FIX: Shift trend to use only CLOSED 4H candles
     df_4h['trend'] = df_4h['trend'].shift(1)
     
-    # ✅ FIX: Set time as index to avoid column collision
     df_4h.set_index('time', inplace=True)
     
     df_15m['tr'] = pd.concat([df_15m['high'] - df_15m['low'], (df_15m['high'] - df_15m['close'].shift()).abs(), (df_15m['low'] - df_15m['close'].shift()).abs()], axis=1).max(axis=1)
@@ -59,8 +54,6 @@ def backtest_btc_smc(df_15m, df_4h):
     df_15m['recent_high'] = df_15m['high'].rolling(window=20).max().shift(1)
     
     df_15m['4h_time'] = df_15m['time'].dt.floor('4h')
-    
-    # ✅ FIX: Use right_index=True
     df_15m = pd.merge_asof(df_15m, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
     
     trades = []
@@ -128,7 +121,7 @@ def backtest_btc_smc(df_15m, df_4h):
     return f"Trades: {total} | Win Rate: {(wins/total)*100:.1f}% | Total R: {total_r:+.2f}R | Expectancy: {total_r/total:+.3f}R"
 
 # ==========================================
-# SOL STRATEGY (4H DONCHIAN TREND)
+# SOL STRATEGY (4H TREND)
 # ==========================================
 def backtest_sol_trend(df_4h):
     df = df_4h.copy()
@@ -196,21 +189,23 @@ def backtest_sol_trend(df_4h):
 # MAIN
 # ==========================================
 if __name__ == "__main__":
-    print("Starting Master Bot Backtest (1 Year, Lookahead-Fixed)...", flush=True)
+    print("Starting Master Bot Backtest (1 Year)...", flush=True)
     
-    for sym in SYMBOLS:
-        print(f"\n{'='*60}", flush=True)
-        print(f"  TESTING {sym}", flush=True)
-        print(f"{'='*60}", flush=True)
-        
-        df_4h = fetch_okx_data(sym, "4h", MONTHS_BACK)
-        if df_4h.empty: continue
-        
-        if sym == "BTC/USDT:USDT":
-            df_15m = fetch_okx_data(sym, "15m", MONTHS_BACK)
-            if df_15m.empty: continue
-            res = backtest_btc_smc(df_15m, df_4h)
-            print(f"BTC 15m SMC (Max 2/Day): {res}", flush=True)
-        else:
-            res = backtest_sol_trend(df_4h)
-            print(f"SOL 4H Trend: {res}", flush=True)
+    # 1. BTC
+    print(f"\n{'='*60}", flush=True)
+    print(f"  TESTING BTC/USDT:USDT", flush=True)
+    print(f"{'='*60}", flush=True)
+    btc_4h = fetch_okx_data("BTC/USDT:USDT", "4h", MONTHS_BACK)
+    btc_15m = fetch_okx_data("BTC/USDT:USDT", "15m", MONTHS_BACK)
+    if not btc_4h.empty and not btc_15m.empty:
+        res_btc = backtest_btc_smc(btc_15m, btc_4h)
+        print(f"BTC 15m SMC (Max 2/Day): {res_btc}", flush=True)
+
+    # 2. SOL
+    print(f"\n{'='*60}", flush=True)
+    print(f"  TESTING SOL/USDT:USDT", flush=True)
+    print(f"{'='*60}", flush=True)
+    sol_4h = fetch_okx_data("SOL/USDT:USDT", "4h", MONTHS_BACK)
+    if not sol_4h.empty:
+        res_sol = backtest_sol_trend(sol_4h)
+        print(f"SOL 4H Trend: {res_sol}", flush=True)
