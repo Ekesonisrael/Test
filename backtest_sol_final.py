@@ -7,8 +7,8 @@ import time
 # CONFIGURATION
 # ==========================================
 SYMBOL = "SOL/USDT:USDT"
-TIMEFRAME = "15m"
-MONTHS_BACK = 6
+TIMEFRAME = "1h"             # ✅ CHANGED TO 1-HOUR
+MONTHS_BACK = 12             # ✅ CHANGED TO 12 MONTHS
 
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 2.5         
@@ -23,8 +23,8 @@ WICK_BUFFER_ATR = 0.1
 # ✅ RSI INDICATOR SETTINGS
 USE_RSI = True
 RSI_PERIOD = 14
-RSI_LONG_MAX = 40  # Only take Longs if RSI is below 40 (Oversold)
-RSI_SHORT_MIN = 60 # Only take Shorts if RSI is above 60 (Overbought)
+RSI_LONG_MAX = 40  
+RSI_SHORT_MIN = 60 
 
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
@@ -71,6 +71,7 @@ def run_backtest(df, split_date, name):
     print(f"\n--- {name} ---", flush=True)
     df.set_index('time', inplace=True)
     
+    # 4H Trend (Dropping the unclosed 4H candle)
     df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     df_4h = df_4h.iloc[:-1] 
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
@@ -79,6 +80,7 @@ def run_backtest(df, split_date, name):
     
     df.reset_index(inplace=True)
     
+    # ATR and Vol MA
     df['high_low'] = df['high'] - df['low']
     df['high_close'] = (df['high'] - df['close'].shift()).abs()
     df['low_close'] = (df['low'] - df['close'].shift()).abs()
@@ -86,6 +88,7 @@ def run_backtest(df, split_date, name):
     df['atr'] = df['tr'].rolling(window=14).mean()
     df['vol_ma'] = df['volume'].rolling(window=20).mean()
     
+    # RSI
     df['rsi'] = calculate_rsi(df['close'], RSI_PERIOD)
 
     df['recent_low'] = df['low'].rolling(window=LOOKBACK).min().shift(1)
@@ -94,7 +97,8 @@ def run_backtest(df, split_date, name):
     df['4h_time'] = df['time'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
     
-    if name == "TRAIN (First 3 Months)":
+    # Split exactly in the middle (6 months train, 6 months test)
+    if name == "TRAIN (First 6 Months)":
         df = df[df['time'] < split_date].reset_index(drop=True)
     else:
         df = df[df['time'] >= split_date].reset_index(drop=True)
@@ -107,6 +111,7 @@ def run_backtest(df, split_date, name):
     while i < len(df) - 5:
         candle = df.iloc[i]
         
+        # Check exits
         for trade in active_trades[:]: 
             exit_triggered = False
             result = None
@@ -123,6 +128,7 @@ def run_backtest(df, split_date, name):
                 trades.append({'result': result, 'r': net_r})
                 active_trades.remove(trade)
 
+        # Check for signals
         sweep_row = df.iloc[i-2]
         conf_row = df.iloc[i-1]
         sweep_key = str(sweep_row['time'])
@@ -189,5 +195,5 @@ if __name__ == "__main__":
     df = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
     if not df.empty:
         split_date = df['time'].iloc[len(df) // 2]
-        run_backtest(df, split_date, "TRAIN (First 3 Months)")
-        run_backtest(df, split_date, "OUT-OF-SAMPLE (Last 3 Months)")
+        run_backtest(df, split_date, "TRAIN (First 6 Months)")
+        run_backtest(df, split_date, "OUT-OF-SAMPLE (Last 6 Months)")
