@@ -49,6 +49,9 @@ def backtest_btc_smc(df_15m, df_4h):
     # ✅ CRITICAL FIX: Shift trend to use only CLOSED 4H candles
     df_4h['trend'] = df_4h['trend'].shift(1)
     
+    # ✅ FIX: Set time as index to avoid column collision
+    df_4h.set_index('time', inplace=True)
+    
     df_15m['tr'] = pd.concat([df_15m['high'] - df_15m['low'], (df_15m['high'] - df_15m['close'].shift()).abs(), (df_15m['low'] - df_15m['close'].shift()).abs()], axis=1).max(axis=1)
     df_15m['atr'] = df_15m['tr'].rolling(window=14).mean()
     df_15m['vol_ma'] = df_15m['volume'].rolling(window=20).mean()
@@ -56,7 +59,9 @@ def backtest_btc_smc(df_15m, df_4h):
     df_15m['recent_high'] = df_15m['high'].rolling(window=20).max().shift(1)
     
     df_15m['4h_time'] = df_15m['time'].dt.floor('4h')
-    df_15m = pd.merge_asof(df_15m, df_4h[['time', 'trend']], left_on='4h_time', right_on='time', direction='backward')
+    
+    # ✅ FIX: Use right_index=True
+    df_15m = pd.merge_asof(df_15m, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
     
     trades = []
     active_trades = []
