@@ -12,24 +12,25 @@ MONTHS_BACK = 6
 
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 2.5         
-VOLUME_MULTIPLIER = 2.5      # ✅ STRICTER: 2.5x volume required
+VOLUME_MULTIPLIER = 2.5      
 LOOKBACK = 20
-FEE_RATE = 0.0010            # 0.1% fee
-MAX_CONCURRENT_TRADES = 3    # Simulating the 9% max open risk cap (3% x 3)
+FEE_RATE = 0.0010            
+MAX_CONCURRENT_TRADES = 3    
 
-# ✅ NEW STOP LOGIC
-USE_WICK_STOP = True         # Put stop loss beyond the sweep wick
-WICK_BUFFER_ATR = 0.1        # Add a small buffer beyond the wick
+USE_WICK_STOP = True         
+WICK_BUFFER_ATR = 0.1        
 
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 def fetch_okx_data(symbol, timeframe, months):
-    print(f"Fetching {months} months of {timeframe} data for {symbol} from OKX...")
+    # ✅ flush=True forces GitHub to print immediately
+    print(f"Fetching {months} months of {timeframe} data for {symbol} from OKX...", flush=True)
     end_time = exchange.milliseconds()
     start_time = end_time - int(months * 30 * 24 * 60 * 60 * 1000)
     
     all_ohlcv = []
     since = start_time
+    fail_count = 0 # ✅ Safety counter
     
     while since < end_time:
         try:
@@ -38,22 +39,26 @@ def fetch_okx_data(symbol, timeframe, months):
                 break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
+            fail_count = 0 # Reset on success
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"Fetch error: {e}")
+            print(f"Fetch error: {e}", flush=True)
+            fail_count += 1
+            if fail_count > 5:
+                print("Too many errors in a row. Breaking loop.", flush=True)
+                break
             time.sleep(2)
             
     df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     df = df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
-    print(f"Fetched {len(df)} candles.")
+    print(f"Fetched {len(df)} candles.", flush=True)
     return df
 
 def run_backtest(df, split_date, name):
-    print(f"\n--- {name} ---")
+    print(f"\n--- {name} ---", flush=True)
     df.set_index('time', inplace=True)
     
-    # 4H Trend (Dropping the unclosed 4H candle)
     df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     df_4h = df_4h.iloc[:-1] 
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
@@ -62,7 +67,6 @@ def run_backtest(df, split_date, name):
     
     df.reset_index(inplace=True)
     
-    # ATR and Vol MA
     df['high_low'] = df['high'] - df['low']
     df['high_close'] = (df['high'] - df['close'].shift()).abs()
     df['low_close'] = (df['low'] - df['close'].shift()).abs()
@@ -76,7 +80,6 @@ def run_backtest(df, split_date, name):
     df['4h_time'] = df['time'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
     
-    # True Out-of-Sample Split
     if name == "TRAIN (First 3 Months)":
         df = df[df['time'] < split_date].reset_index(drop=True)
     else:
@@ -90,7 +93,6 @@ def run_backtest(df, split_date, name):
     while i < len(df) - 5:
         candle = df.iloc[i]
         
-        # 1. CHECK EXITS (Conservative: If SL and TP hit in same candle, assume LOSS)
         for trade in active_trades[:]: 
             exit_triggered = False
             result = None
@@ -112,7 +114,6 @@ def run_backtest(df, split_date, name):
                 trades.append({'result': result, 'r': net_r})
                 active_trades.remove(trade)
 
-        # 2. CHECK SIGNALS (Using closed candles: i-2 sweep, i-1 confirm, i entry)
         sweep_row = df.iloc[i-2]
         conf_row = df.iloc[i-1]
         sweep_key = str(sweep_row['time'])
@@ -136,7 +137,6 @@ def run_backtest(df, split_date, name):
                 entry = candle['open']
                 atr = sweep_row['atr']
                 
-                # ✅ NEW STOP LOGIC (Wick Stop)
                 if side == 'LONG':
                     sl = entry - (atr * ATR_MULTIPLIER)
                     if USE_WICK_STOP:
@@ -157,7 +157,7 @@ def run_backtest(df, split_date, name):
 
     total = len(trades)
     if total == 0:
-        print("No trades found in this period.")
+        print("No trades found in this period.", flush=True)
         return
         
     wins = sum(1 for t in trades if t['result'] == 'WIN')
@@ -166,13 +166,13 @@ def run_backtest(df, split_date, name):
     running_max = np.maximum.accumulate(cumulative_r)
     max_dd = np.min(cumulative_r - running_max) if len(cumulative_r) > 0 else 0
 
-    print(f"Trades: {total} | Win Rate: {(wins/total)*100:.1f}%")
-    print(f"Total R: {total_r:+.2f}R | Max Drawdown: {max_dd:.2f}R")
+    print(f"Trades: {total} | Win Rate: {(wins/total)*100:.1f}%", flush=True)
+    print(f"Total R: {total_r:+.2f}R | Max Drawdown: {max_dd:.2f}R", flush=True)
 
 if __name__ == "__main__":
+    print("Starting Backtest...", flush=True)
     df = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
     if not df.empty:
-        # Split exactly in the middle (3 months train, 3 months test)
         split_date = df['time'].iloc[len(df) // 2]
         run_backtest(df, split_date, "TRAIN (First 3 Months)")
         run_backtest(df, split_date, "OUT-OF-SAMPLE (Last 3 Months)")
