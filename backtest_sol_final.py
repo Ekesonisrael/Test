@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 
 # ==========================================
-# CONFIGURATION (SOL ONLY)
+# CONFIGURATION (BTC ONLY)
 # ==========================================
-SYMBOL = "SOL/USDT:USDT"
+SYMBOL = "BTC/USDT:USDT"     # ✅ CHANGED TO BTC
 TIMEFRAME = "4h"
-MONTHS_BACK = 48             # 4 Years (To get enough trades)
+MONTHS_BACK = 48             # 4 Years 
 
 # Exits (R-based)
 ATR_MULTIPLIER = 2.0         
@@ -155,7 +155,7 @@ def backtest(df):
     return trades
 
 if __name__ == "__main__":
-    print("Starting SOL 4H Backtest...", flush=True)
+    print("Starting BTC 4H Backtest...", flush=True)
     raw = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
     if raw.empty:
         print("No data.")
@@ -185,7 +185,7 @@ if __name__ == "__main__":
         pf = wins.sum() / gross_loss if gross_loss > 0 else float("inf")
 
         print("\n" + "="*50)
-        print("  SOL 4H MONSTER BACKTEST RESULTS (4 YEARS)")
+        print("  BTC 4H MONSTER BACKTEST RESULTS (4 YEARS)")
         print("="*50)
         print(f"  Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%")
         print(f"  Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}")
