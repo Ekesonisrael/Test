@@ -3,9 +3,16 @@ name: Run Final SOL Backtest
 on:
   workflow_dispatch:
 
+# ✅ THIS FORCES GITHUB TO CANCEL THE STUCK RUN
+concurrency:
+  group: sol-backtest-queue
+  cancel-in-progress: true
+
 jobs:
   run-backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
