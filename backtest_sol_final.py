@@ -12,10 +12,14 @@ MONTHS_BACK = 6
 
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 2.5         
-VOLUME_MULTIPLIER = 1.5
+VOLUME_MULTIPLIER = 2.5      # ✅ STRICTER: 2.5x volume required
 LOOKBACK = 20
 FEE_RATE = 0.0010            # 0.1% fee
 MAX_CONCURRENT_TRADES = 3    # Simulating the 9% max open risk cap (3% x 3)
+
+# ✅ NEW STOP LOGIC
+USE_WICK_STOP = True         # Put stop loss beyond the sweep wick
+WICK_BUFFER_ATR = 0.1        # Add a small buffer beyond the wick
 
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
@@ -132,12 +136,17 @@ def run_backtest(df, split_date, name):
                 entry = candle['open']
                 atr = sweep_row['atr']
                 
+                # ✅ NEW STOP LOGIC (Wick Stop)
                 if side == 'LONG':
                     sl = entry - (atr * ATR_MULTIPLIER)
+                    if USE_WICK_STOP:
+                        sl = min(sl, sweep_row['low'] - (atr * WICK_BUFFER_ATR))
                     risk = entry - sl
                     tp = entry + (risk * RISK_REWARD)
                 else:
                     sl = entry + (atr * ATR_MULTIPLIER)
+                    if USE_WICK_STOP:
+                        sl = max(sl, sweep_row['high'] + (atr * WICK_BUFFER_ATR))
                     risk = sl - entry
                     tp = entry - (risk * RISK_REWARD)
                 
