@@ -8,7 +8,7 @@ import pandas as pd
 # ==========================================
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 TIMEFRAME = "4h"
-MONTHS_BACK = 5              # ✅ 5 Months of testing
+MONTHS_BACK = 48             # ✅ CHANGED TO 4 YEARS
 
 # Exits (R-based)
 ATR_MULTIPLIER = 2.0         
@@ -158,9 +158,9 @@ if __name__ == "__main__":
     print(f"Starting 3-Coin 4H Backtest ({MONTHS_BACK} Months)...", flush=True)
     
     for sym in SYMBOLS:
-        print(f"\n{'='*50}")
-        print(f"  TESTING {sym}")
-        print(f"{'='*50}")
+        print(f"\n{'='*50}", flush=True)
+        print(f"  TESTING {sym}", flush=True)
+        print(f"{'='*50}", flush=True)
         
         raw = fetch_okx_data(sym, TIMEFRAME, MONTHS_BACK)
         if raw.empty:
