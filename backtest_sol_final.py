@@ -1,199 +1,242 @@
-import ccxt
-import pandas as pd
-import numpy as np
 import time
+
+import ccxt
+import numpy as np
+import pandas as pd
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOL = "SOL/USDT:USDT"
-TIMEFRAME = "1h"             # ✅ CHANGED TO 1-HOUR
-MONTHS_BACK = 12             # ✅ CHANGED TO 12 MONTHS
+SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+TIMEFRAMES = ["1h", "4h"]
+MONTHS_BACK = 12
 
-RISK_REWARD = 2.0
-ATR_MULTIPLIER = 2.5         
-VOLUME_MULTIPLIER = 2.5      
-LOOKBACK = 20
-FEE_RATE = 0.0010            
-MAX_CONCURRENT_TRADES = 3    
+# Exits (R-based, so account risk % does not change the R results)
+ATR_MULTIPLIER = 2.0         # initial stop distance
+TRAIL_ATR_MULTIPLIER = 3.0   # chandelier trail distance
 
-USE_WICK_STOP = True         
-WICK_BUFFER_ATR = 0.1        
+# Costs
+FEE_PER_SIDE = 0.0005        # 0.05% taker per side -> 0.10% round trip
+SLIPPAGE_PER_SIDE = 0.0004   # 0.04% adverse slippage per side (assumption)
+FUNDING_PER_8H = 0.0001      # 0.01% per 8h, charged as a cost both ways (conservative)
 
-# ✅ RSI INDICATOR SETTINGS
-USE_RSI = True
-RSI_PERIOD = 14
-RSI_LONG_MAX = 40  
-RSI_SHORT_MIN = 60 
+# Indicators
+ADX_PERIOD = 14
+ADX_THRESHOLD = 20
+ATR_PERIOD = 14
+EMA_PERIOD = 200
+DONCHIAN_PERIOD = 20
+VOL_MA_PERIOD = 20
+VOL_MULT = 1.5
 
-exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+WARMUP_BARS = 300            # EMA200 must be settled before the first trade
+MIN_TRADES = 30              # below this, results are noise
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+TF_HOURS = {"15m": 0.25, "30m": 0.5, "1h": 1, "2h": 2, "4h": 4, "1d": 24}
 
+exchange = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+
+
+# ==========================================
+# DATA
+# ==========================================
 def fetch_okx_data(symbol, timeframe, months):
-    print(f"Fetching {months} months of {timeframe} data for {symbol} from OKX...", flush=True)
+    print(f"Fetching {months}m of {timeframe} for {symbol}...", flush=True)
     end_time = exchange.milliseconds()
-    start_time = end_time - int(months * 30 * 24 * 60 * 60 * 1000)
-    
-    all_ohlcv = []
-    since = start_time
-    fail_count = 0 
-    
+    since = end_time - int(months * 30 * 24 * 60 * 60 * 1000)
+    rows, fails = [], 0
+
     while since < end_time:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
-            if not ohlcv:
+            batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
+            if not batch:
                 break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            fail_count = 0 
+            rows.extend(batch)
+            since = batch[-1][0] + 1
+            fails = 0
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
             print(f"Fetch error: {e}", flush=True)
-            fail_count += 1
-            if fail_count > 5:
-                print("Too many errors. Breaking loop.", flush=True)
+            fails += 1
+            if fails > 5:
                 break
             time.sleep(2)
-            
-    df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df = df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
-    print(f"Fetched {len(df)} candles.", flush=True)
+
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+
+def check_integrity(df, timeframe, months):
+    """If this fails, every number downstream is garbage."""
+    step = pd.Timedelta(hours=TF_HOURS[timeframe])
+    gaps = int((df["time"].diff() > step).sum())
+    expected = int(months * 30 * 24 / TF_HOURS[timeframe])
+    coverage = len(df) / expected
+    print(f"Bars: {len(df)} (expected ~{expected}, coverage {coverage:.0%}) | gaps: {gaps}", flush=True)
+    if gaps > 0 or coverage < 0.95:
+        print("WARNING: data has gaps or is incomplete. Do not trust results.", flush=True)
+        return False
+    return True
+
+
+# ==========================================
+# INDICATORS (all causal, computed once on the full series)
+# ==========================================
+def add_indicators(df):
+    df = df.copy()
+    prev_close = df["close"].shift()
+    df["tr"] = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    up = df["high"].diff()
+    down = -df["low"].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    a = 1 / ADX_PERIOD
+    tr_s = df["tr"].ewm(alpha=a, adjust=False).mean()
+    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
+    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=a, adjust=False).mean() / tr_s
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    df["adx"] = dx.ewm(alpha=a, adjust=False).mean()
+
+    df["atr"] = df["tr"].ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()  # Wilder ATR
+    df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["vol_ma"] = df["volume"].rolling(VOL_MA_PERIOD).mean()
+    df["don_high"] = df["high"].rolling(DONCHIAN_PERIOD).max().shift(1)
+    df["don_low"] = df["low"].rolling(DONCHIAN_PERIOD).min().shift(1)
     return df
 
-def run_backtest(df, split_date, name):
-    print(f"\n--- {name} ---", flush=True)
-    df.set_index('time', inplace=True)
-    
-    # 4H Trend (Dropping the unclosed 4H candle)
-    df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    df_4h = df_4h.iloc[:-1] 
-    df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
-    df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
-    df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-    
-    df.reset_index(inplace=True)
-    
-    # ATR and Vol MA
-    df['high_low'] = df['high'] - df['low']
-    df['high_close'] = (df['high'] - df['close'].shift()).abs()
-    df['low_close'] = (df['low'] - df['close'].shift()).abs()
-    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    df['vol_ma'] = df['volume'].rolling(window=20).mean()
-    
-    # RSI
-    df['rsi'] = calculate_rsi(df['close'], RSI_PERIOD)
 
-    df['recent_low'] = df['low'].rolling(window=LOOKBACK).min().shift(1)
-    df['recent_high'] = df['high'].rolling(window=LOOKBACK).max().shift(1)
-
-    df['4h_time'] = df['time'].dt.floor('4h')
-    df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
-    
-    # Split exactly in the middle (6 months train, 6 months test)
-    if name == "TRAIN (First 6 Months)":
-        df = df[df['time'] < split_date].reset_index(drop=True)
-    else:
-        df = df[df['time'] >= split_date].reset_index(drop=True)
+# ==========================================
+# BACKTEST
+# ==========================================
+def backtest(df, start, end, tf_hours):
+    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
+    atr, adx, ema = df["atr"].values, df["adx"].values, df["ema200"].values
+    vol, vma = df["volume"].values, df["vol_ma"].values
+    dhi, dlo = df["don_high"].values, df["don_low"].values
 
     trades = []
-    active_trades = []
-    attempted_sweeps = set()
-    i = 50 
+    tr = None
 
-    while i < len(df) - 5:
-        candle = df.iloc[i]
-        
-        # Check exits
-        for trade in active_trades[:]: 
-            exit_triggered = False
-            result = None
-            
-            if trade['side'] == 'LONG':
-                if candle['low'] <= trade['sl']: result, exit_triggered = 'LOSS', True
-                elif candle['high'] >= trade['tp']: result, exit_triggered = 'WIN', True
-            elif trade['side'] == 'SHORT':
-                if candle['high'] >= trade['sl']: result, exit_triggered = 'LOSS', True
-                elif candle['low'] <= trade['tp']: result, exit_triggered = 'WIN', True
-                    
-            if exit_triggered:
-                net_r = (RISK_REWARD if result == 'WIN' else -1.0) - trade['cost_r']
-                trades.append({'result': result, 'r': net_r})
-                active_trades.remove(trade)
+    def close_trade(t, i, raw_exit, reason):
+        if t["side"] == "LONG":
+            px = raw_exit * (1 - SLIPPAGE_PER_SIDE)
+            pnl = (px - t["entry"]) / t["entry"]
+        else:
+            px = raw_exit * (1 + SLIPPAGE_PER_SIDE)
+            pnl = (t["entry"] - px) / t["entry"]
+        held_hours = (i - t["entry_idx"] + 1) * tf_hours
+        funding = FUNDING_PER_8H * held_hours / 8
+        net_r = (pnl - 2 * FEE_PER_SIDE - funding) / t["risk_pct"]
+        trades.append({"side": t["side"], "r": net_r, "reason": reason})
 
-        # Check for signals
-        sweep_row = df.iloc[i-2]
-        conf_row = df.iloc[i-1]
-        sweep_key = str(sweep_row['time'])
-        
-        if sweep_key not in attempted_sweeps:
-            vol_ok = sweep_row['volume'] > (sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
-            swept_low = (sweep_row['low'] < sweep_row['recent_low']) and (sweep_row['close'] > sweep_row['recent_low']) and vol_ok
-            swept_high = (sweep_row['high'] > sweep_row['recent_high']) and (sweep_row['close'] < sweep_row['recent_high']) and vol_ok
+    def manage(t, i):
+        """Stop is checked against the level known BEFORE this candle.
+        The trail is updated AFTER the candle closes, so it only applies from i+1."""
+        if t["side"] == "LONG":
+            if l[i] <= t["sl"]:
+                close_trade(t, i, min(o[i], t["sl"]), "STOP")  # gap-aware
+                return True
+            t["peak"] = max(t["peak"], h[i])
+            t["sl"] = max(t["sl"], t["peak"] - TRAIL_ATR_MULTIPLIER * atr[i])
+        else:
+            if h[i] >= t["sl"]:
+                close_trade(t, i, max(o[i], t["sl"]), "STOP")
+                return True
+            t["peak"] = min(t["peak"], l[i])
+            t["sl"] = min(t["sl"], t["peak"] + TRAIL_ATR_MULTIPLIER * atr[i])
+        return False
 
-            conf_long = conf_row['close'] > conf_row['open']
-            conf_short = conf_row['close'] < conf_row['open']
+    for i in range(max(start, 1), end):
+        had_trade = tr is not None
+        if had_trade and manage(tr, i):
+            tr = None
 
-            rsi_ok_long = True
-            rsi_ok_short = True
-            if USE_RSI:
-                rsi_ok_long = sweep_row['rsi'] < RSI_LONG_MAX
-                rsi_ok_short = sweep_row['rsi'] > RSI_SHORT_MIN
+        # No same-candle re-entry after an exit: entry is at the open, the exit came later.
+        if had_trade:
+            continue
 
-            side = None
-            if sweep_row['trend'] == 1 and swept_low and conf_long and rsi_ok_long:
-                side = 'LONG'
-            elif sweep_row['trend'] == -1 and swept_high and conf_short and rsi_ok_short:
-                side = 'SHORT'
+        s = i - 1  # signal candle, fully closed
+        vals = (atr[s], adx[s], ema[s], vma[s], dhi[s], dlo[s])
+        if any(np.isnan(v) for v in vals):
+            continue
 
-            if side and len(active_trades) < MAX_CONCURRENT_TRADES:
-                attempted_sweeps.add(sweep_key)
-                entry = candle['open']
-                atr = sweep_row['atr']
-                
-                if side == 'LONG':
-                    sl = entry - (atr * ATR_MULTIPLIER)
-                    if USE_WICK_STOP:
-                        sl = min(sl, sweep_row['low'] - (atr * WICK_BUFFER_ATR))
-                    risk = entry - sl
-                    tp = entry + (risk * RISK_REWARD)
-                else:
-                    sl = entry + (atr * ATR_MULTIPLIER)
-                    if USE_WICK_STOP:
-                        sl = max(sl, sweep_row['high'] + (atr * WICK_BUFFER_ATR))
-                    risk = sl - entry
-                    tp = entry - (risk * RISK_REWARD)
-                
-                cost_r = FEE_RATE / (risk / entry) 
-                active_trades.append({'side': side, 'entry': entry, 'sl': sl, 'tp': tp, 'cost_r': cost_r})
-                
-        i += 1
+        trending = adx[s] > ADX_THRESHOLD
+        vol_ok = vol[s] > vma[s] * VOL_MULT
 
-    total = len(trades)
-    if total == 0:
-        print("No trades found in this period.", flush=True)
+        if trending and vol_ok and c[s] > ema[s] and c[s] > dhi[s]:
+            entry = o[i] * (1 + SLIPPAGE_PER_SIDE)
+            sl = entry - ATR_MULTIPLIER * atr[s]
+            tr = {"side": "LONG", "entry": entry, "sl": sl, "peak": entry,
+                  "risk_pct": (entry - sl) / entry, "entry_idx": i}
+        elif trending and vol_ok and c[s] < ema[s] and c[s] < dlo[s]:
+            entry = o[i] * (1 - SLIPPAGE_PER_SIDE)
+            sl = entry + ATR_MULTIPLIER * atr[s]
+            tr = {"side": "SHORT", "entry": entry, "sl": sl, "peak": entry,
+                  "risk_pct": (sl - entry) / entry, "entry_idx": i}
+
+        # The entry candle gets its own stop check immediately.
+        if tr is not None and manage(tr, i):
+            tr = None
+
+    if tr is not None:  # don't silently drop open trades
+        close_trade(tr, end - 1, c[end - 1], "EOD")
+
+    return trades
+
+
+# ==========================================
+# REPORTING
+# ==========================================
+def report(trades, label):
+    print(f"\n  [{label}]", flush=True)
+    n = len(trades)
+    if n == 0:
+        print("  No trades.", flush=True)
         return
-        
-    wins = sum(1 for t in trades if t['result'] == 'WIN')
-    total_r = sum(t['r'] for t in trades)
-    cumulative_r = np.cumsum([t['r'] for t in trades])
-    running_max = np.maximum.accumulate(cumulative_r)
-    max_dd = np.min(cumulative_r - running_max) if len(cumulative_r) > 0 else 0
+    r = np.array([t["r"] for t in trades])
+    wins, losses = r[r > 0], r[r <= 0]
+    cum = np.cumsum(r)
+    max_dd = float(np.min(cum - np.maximum.accumulate(cum)))
 
-    print(f"Trades: {total} | Win Rate: {(wins/total)*100:.1f}%", flush=True)
-    print(f"Total R: {total_r:+.2f}R | Max Drawdown: {max_dd:.2f}R", flush=True)
+    streak = longest = 0
+    for x in r:
+        streak = streak + 1 if x <= 0 else 0
+        longest = max(longest, streak)
 
+    gross_loss = abs(losses.sum())
+    pf = wins.sum() / gross_loss if gross_loss > 0 else float("inf")
+
+    print(f"  Trades: {n} | Win rate: {len(wins) / n * 100:.1f}%", flush=True)
+    print(f"  Total R: {r.sum():+.2f} | Expectancy: {r.mean():+.3f}R/trade | PF: {pf:.2f}", flush=True)
+    print(f"  Avg win: {wins.mean() if len(wins) else 0:.2f}R | Avg loss: {losses.mean() if len(losses) else 0:.2f}R", flush=True)
+    print(f"  Max DD: {max_dd:.2f}R | Longest losing streak: {longest}", flush=True)
+    if n < MIN_TRADES:
+        print(f"  !! Only {n} trades (<{MIN_TRADES}). Statistically meaningless.", flush=True)
+
+
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
-    print("Starting Backtest...", flush=True)
-    df = fetch_okx_data(SYMBOL, TIMEFRAME, MONTHS_BACK)
-    if not df.empty:
-        split_date = df['time'].iloc[len(df) // 2]
-        run_backtest(df, split_date, "TRAIN (First 6 Months)")
-        run_backtest(df, split_date, "OUT-OF-SAMPLE (Last 6 Months)")
+    print("Starting Monster Backtest v2...", flush=True)
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            print(f"\n{'=' * 50}\n{symbol} | {tf}\n{'=' * 50}", flush=True)
+            try:
+                raw = fetch_okx_data(symbol, tf, MONTHS_BACK)
+                if raw.empty or not check_integrity(raw, tf, MONTHS_BACK):
+                    print("Skipping: bad data.", flush=True)
+                    continue
+                df = add_indicators(raw)
+                mid = len(df) // 2
+                tfh = TF_HOURS[tf]
+                report(backtest(df, WARMUP_BARS, mid, tfh), "TRAIN (first half, after warmup)")
+                report(backtest(df, mid, len(df), tfh), "OUT-OF-SAMPLE (second half)")
+            except Exception as e:
+                print(f"Failed on {symbol} {tf}: {e}", flush=True)
