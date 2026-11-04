@@ -17,6 +17,10 @@ FEE_RATE = 0.0010
 USE_WICK_STOP = True         
 WICK_BUFFER_ATR = 0.1        
 
+# ✅ TESTING THE BEST CONFIGURATION
+MAX_TRADES_PER_DAY = 2
+MAX_TRADES_PER_WEEK = None
+
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 def fetch_okx_data(symbol, timeframe, months):
@@ -42,24 +46,27 @@ def fetch_okx_data(symbol, timeframe, months):
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
-def run_backtest(df, max_trades_per_day, max_trades_per_week, label):
+def run_backtest(df, btc_df, symbol, label):
     df = df.copy()
+    btc_df = btc_df.copy()
     
-    # 1. RESAMPLE TO 4H
+    # Calculate 4H Trend (Lookahead-free)
     df.set_index('time', inplace=True)
     df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    
-    # Calculate Indicators on closed 4H candles
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-    
-    # ✅ CRITICAL FIX: Shift trend by 1 so we only use CLOSED 4H candles
-    df_4h['trend'] = df_4h['trend'].shift(1)
-    
+    df_4h['trend'] = df_4h['trend'].shift(1) 
     df.reset_index(inplace=True)
     
-    # 2. CALCULATE 15M INDICATORS
+    # ✅ BTC DOMINANCE PROXY (15m EMA 50)
+    btc_df['btc_ema50'] = btc_df['close'].ewm(span=50, adjust=False).mean()
+    btc_df['btc_trend'] = np.where(btc_df['close'] > btc_df['btc_ema50'], 1, -1)
+    
+    # Merge BTC trend into the main dataframe
+    df = pd.merge_asof(df, btc_df[['time', 'btc_trend']], on='time', direction='backward')
+    
+    # ATR & Volume MA
     df['high_low'] = df['high'] - df['low']
     df['high_close'] = (df['high'] - df['close'].shift()).abs()
     df['low_close'] = (df['low'] - df['close'].shift()).abs()
@@ -69,16 +76,13 @@ def run_backtest(df, max_trades_per_day, max_trades_per_week, label):
     df['recent_low'] = df['low'].rolling(window=LOOKBACK).min().shift(1)
     df['recent_high'] = df['high'].rolling(window=LOOKBACK).max().shift(1)
 
-    # ✅ The floored timestamp now perfectly matches the shifted 4H trend
     df['4h_time'] = df['time'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
     
     trades = []
     active_trades = []
     attempted_sweeps = set()
-    
     daily_trade_counts = {}
-    weekly_trade_counts = {}
     
     i = 50 
 
@@ -116,25 +120,26 @@ def run_backtest(df, max_trades_per_day, max_trades_per_week, label):
             conf_short = conf_row['close'] < conf_row['open']
 
             side = None
-            if sweep_row['trend'] == 1 and swept_low and conf_long: side = 'LONG'
-            elif sweep_row['trend'] == -1 and swept_high and conf_short: side = 'SHORT'
+            
+            # ✅ APPLY BTC DOMINANCE FILTER
+            btc_is_bullish = sweep_row['btc_trend'] == 1
+            btc_is_bearish = sweep_row['btc_trend'] == -1
+            
+            if sweep_row['trend'] == 1 and swept_low and conf_long and btc_is_bullish: 
+                side = 'LONG'
+            elif sweep_row['trend'] == -1 and swept_high and conf_short and btc_is_bearish: 
+                side = 'SHORT'
 
             if side:
-                # Check Trade Limits
                 day_str = str(sweep_row['time'].date())
-                week_str = f"{sweep_row['time'].year}-{sweep_row['time'].isocalendar()[1]}"
-                
                 d_count = daily_trade_counts.get(day_str, 0)
-                w_count = weekly_trade_counts.get(week_str, 0)
                 
                 can_trade = True
-                if max_trades_per_day and d_count >= max_trades_per_day: can_trade = False
-                if max_trades_per_week and w_count >= max_trades_per_week: can_trade = False
+                if MAX_TRADES_PER_DAY and d_count >= MAX_TRADES_PER_DAY: can_trade = False
                 
                 if can_trade:
                     attempted_sweeps.add(sweep_key)
                     daily_trade_counts[day_str] = d_count + 1
-                    weekly_trade_counts[week_str] = w_count + 1
                     
                     entry = candle['open']
                     atr = sweep_row['atr']
@@ -155,38 +160,27 @@ def run_backtest(df, max_trades_per_day, max_trades_per_week, label):
                 
         i += 1
 
-    # CALCULATE METRICS
     total = len(trades)
-    if total == 0: return f"{label}: No trades found."
+    if total == 0: return f"{symbol} ({label}): No trades found."
         
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
-    
     win_rate = (wins/total)*100 if total > 0 else 0
     expectancy = total_r / total if total > 0 else 0
     
-    return f"{label}: {total} trades | Win Rate: {win_rate:.1f}% | Total R: {total_r:+.2f}R | Expectancy: {expectancy:+.3f}R"
+    return f"{symbol} ({label}): {total} trades | Win Rate: {win_rate:.1f}% | Total R: {total_r:+.2f}R | Expectancy: {expectancy:+.3f}R"
 
 if __name__ == "__main__":
-    print("Starting Frequency Analysis Backtest (Lookahead Fixed)...", flush=True)
+    print("Starting BTC Dominance Filter Backtest...", flush=True)
     
-    configs = [
-        (None, None, "Unlimited"),
-        (2, None, "Max 2/Day"),
-        (1, None, "Max 1/Day"),
-        (None, 5, "Max 5/Week"),
-        (None, 3, "Max 3/Week"),
-        (None, 1, "Max 1/Week")
-    ]
+    # Fetch BTC data first for the filter
+    btc_raw = fetch_okx_data("BTC/USDT:USDT", TIMEFRAME, MONTHS_BACK)
     
     for sym in SYMBOLS:
-        print(f"\n{'='*60}", flush=True)
-        print(f"  RESULTS FOR {sym}", flush=True)
-        print(f"{'='*60}", flush=True)
-        
         raw = fetch_okx_data(sym, TIMEFRAME, MONTHS_BACK)
         if raw.empty: continue
         
-        for max_day, max_week, label in configs:
-            res = run_backtest(raw, max_day, max_week, label)
-            print(res, flush=True)
+        res = run_backtest(raw, btc_raw, sym, "Max 2/Day + BTC Filter")
+        print("\n" + "="*60, flush=True)
+        print(res, flush=True)
+        print("="*60, flush=True)
