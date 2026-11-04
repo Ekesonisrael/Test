@@ -1,0 +1,31 @@
+name: Run Final SOL Backtest
+
+on:
+  workflow_dispatch:
+
+# ✅ Prevents GitHub from getting stuck on queued runs
+concurrency:
+  group: sol-backtest-queue
+  cancel-in-progress: true
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # ✅ Kills the job if it hangs for 15 minutes
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy ccxt
+
+      - name: Run Backtest
+        run: python backtest_sol_final.py
